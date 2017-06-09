@@ -21,133 +21,124 @@ for a sequence of operations to be done remotely and not losing state.
 A file could be opened remotely, do some other things and then write
 to the same opened file without opening the file again.
 
+The remote server can be executed as a different user by using the sudo
+option and sending seteuid. The server can be executed locally as well
+using fork when running as the same user or using the shell when the
+sudo option is used.
+
 In order to use this module the user id must be able to 'ssh' to the
 remote host without the need for a password.
 """
 import os
-import re
 import time
+import types
 import inspect
 import nfstest_config as c
 from baseobj import BaseObj
 from subprocess import Popen, PIPE
-from multiprocessing.connection import Client
+from multiprocessing.connection import Client, Listener
 
 # Module constants
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2013 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.1"
+__version__   = "1.2"
 
 # Constants
 PORT = 9900
 
-# This is a the server which is sent using the ssh command
-# It is minimal just to get a connection and execute the
-# real remote procedure server to service requests
-def bare_server(port, logfile):
-    """Bare-bones remote server"""
-    from multiprocessing.connection import Listener
+# Imports needed for RemoteServer class
+IMPORTS = """
+import time
+import types
+from multiprocessing.connection import Listener
+"""
 
-    fd = open(logfile, "w", 0)
-    address = ("", port)
-    listener = Listener(address)
-    conn = listener.accept()
-    fd.write("Connection accepted\n")
-    # Wait for main server and execute it
-    msg = conn.recv()
-    try:
-        exec(msg)
-    except Exception as e:
-        fd.write("ERROR: %r\n" % e)
-    fd.close()
-    listener.close()
+class RemoteServer:
+    def __init__(self, port, logfile=None):
+        """Remote procedure server"""
+        self.port     = port
+        self.logfile  = logfile
+        self.fd       = None
+        self.conn     = None
+        self.listener = None
 
-def write_log(fd, msg, nl="\n"):
-    """Return timestamp"""
-    tt = time.time()
-    msec = "%06d" % (1000000 * (tt - int(tt)))
-    tstamp = time.strftime("%H:%M:%S.", time.localtime(tt)) + msec
-    fd.write(tstamp + " - " + msg + nl)
-    fd.flush()
+    def __del__(self):
+        """Destructor"""
+        if self.fd is not None:
+            self.fd.close()
+        if self.listener is not None:
+            self.listener.close()
 
-def proc_requests(fd, conn):
-    """Main remote procedure server
+    def log(self, msg):
+        """Write message to log file"""
+        if self.fd is None:
+            return
+        curtime = time.time()
+        msec = "%06d" % (1000000 * (curtime - int(curtime)))
+        tstamp = time.strftime("%H:%M:%S.", time.localtime(curtime)) + msec
+        self.fd.write(tstamp + " - " + msg + "\n")
+        self.fd.flush()
 
-       fd:
-           File descriptor for logfile
-       conn:
-           Connection object
-    """
-    import types
-    write_log(fd, "Running proc_requests")
-    while True:
-        msg = conn.recv()
-        write_log(fd, "Received %r" % msg)
-        if type(msg) is dict:
-            try:
-                # Get command
-                cmd  = msg.get('cmd')
-                # Get function/statement/expression and positional arguments
-                kwts = msg.get('kwts', ())
-                fstr = kwts[0]
-                kwts = kwts[1:]
-                # Get named arguments
-                kwds = msg.get('kwds', {})
-            except Exception as e:
-                write_log(fd, "ERROR: %r" % e)
-                conn.send(e)
-            if cmd == 'run':
-                # Call function
+    def start(self):
+        if self.logfile is not None:
+            self.fd = open(self.logfile, "w", 0)
+        self.listener = Listener(("", self.port))
+        self.conn = self.listener.accept()
+        self.log("Connection accepted\n")
+
+        while True:
+            msg = self.conn.recv()
+            self.log("RECEIVED: %r" % msg)
+            if type(msg) is dict:
                 try:
-                    # Find if function is defined
-                    write_log(fd, "RUN: '%s'" % fstr)
-                    if type(fstr) in [types.FunctionType, types.BuiltinFunctionType, types.MethodType]:
-                        # This is a function
-                        func = fstr
-                    else:
-                        # Find symbol in globals then in locals
-                        func = globals().get(fstr)
-                        if func is None:
+                    # Get command
+                    cmd  = msg.get("cmd")
+                    # Get function/statement/expression and positional arguments
+                    kwts = msg.get("kwts", ())
+                    fstr = kwts[0]
+                    kwts = kwts[1:]
+                    # Get named arguments
+                    kwds = msg.get("kwds", {})
+
+                    if cmd == "run":
+                        # Find if function is defined
+                        if type(fstr) in [types.FunctionType, types.BuiltinFunctionType, types.MethodType]:
+                            # This is a function
+                            func = fstr
+                        else:
+                            # Find symbol in locals then in globals
                             func = locals().get(fstr)
-                    if func is None:
-                        raise Exception("function not found")
-                    # Run function with all its arguments
-                    out = func(*kwts, **kwds)
-                    write_log(fd, "RESULT: " + repr(out))
-                    conn.send(out)
+                            if func is None:
+                                func = globals().get(fstr)
+                        if func is None:
+                            raise Exception("function not found")
+                        # Run function with all its arguments
+                        out = func(*kwts, **kwds)
+                        self.log("RESULT: " + repr(out))
+                        self.conn.send(out)
+                    elif cmd == "eval":
+                        # Evaluate expression
+                        out = eval(fstr)
+                        self.log("RESULT: " + repr(out))
+                        self.conn.send(out)
+                    elif cmd == "exec":
+                        # Execute statement
+                        exec(fstr)
+                        self.log("EXEC done")
+                        self.conn.send(None)
+                    else:
+                        emsg = "Unknown procedure"
+                        self.log("ERROR: %s" % emsg)
+                        self.conn.send(Exception(emsg))
                 except Exception as e:
-                    write_log(fd, "ERROR: %r" % e)
-                    conn.send(e)
-            elif cmd == 'eval':
-                # Evaluate expression
-                try:
-                    write_log(fd, "EVAL: '%s'" % fstr)
-                    out = eval(fstr)
-                    write_log(fd, "RESULT: " + repr(out))
-                    conn.send(out)
-                except Exception as e:
-                    write_log(fd, "ERROR: %r" % e)
-                    conn.send(e)
-            elif cmd == 'exec':
-                # Execute statement
-                try:
-                    write_log(fd, "EXEC:\n%s" % fstr)
-                    exec(fstr)
-                    write_log(fd, "EXEC done")
-                    conn.send(None)
-                except Exception as e:
-                    write_log(fd, "ERROR: %r" % e)
-                    conn.send(e)
-            else:
-                emsg = "Unknown procedure"
-                write_log(fd, "ERROR: %s" % emsg)
-                conn.send(Exception(emsg))
-        if msg == 'close':
-            # Request to close the connection,
-            # exit the loop and terminate the server
-            conn.close()
-            break
+                    self.log("ERROR: %r" % e)
+                    self.conn.send(e)
+            if msg == "close":
+                # Request to close the connection,
+                # exit the loop and terminate the server
+                self.conn.close()
+                break
 
 class Rexec(BaseObj):
     """Rexec object
@@ -159,6 +150,8 @@ class Rexec(BaseObj):
                Name or IP address of remote server
            logfile:
                Name of logfile to create on remote server
+           sudo:
+               Run remote server as root
 
        Usage:
            from nfstest.rexec import Rexec
@@ -209,31 +202,41 @@ class Rexec(BaseObj):
            x.run(os.close, fd)
 
            # Use of positional arguments
-           out = x.run('get_time', 2)
+           out = x.run("get_time", 2)
 
            # Use of named arguments
-           out = x.run('get_time', delay=2)
+           out = x.run("get_time", delay=2)
 
            # Use of NOWAIT option for long running functions so other things
            # can be done while waiting
-           x.run('get_time', 2, NOWAIT=True)
+           x.run("get_time", 2, NOWAIT=True)
            while True:
                # Poll every 0.1 secs to see if function has finished
                if x.poll(0.1):
                    # Get results
                    out = x.results()
                    break
+
+           # Create remote procedure object as a different user
+           # First, run the remote server as root
+           x = Rexec("192.168.0.85", sudo=True)
+           # Then set the effective user id
+           x.run(os.seteuid, 1000)
     """
-    def __init__(self, servername="", logfile=None, sync_timeout=0.1):
+    def __init__(self, servername=None, logfile=None, sudo=False, sync_timeout=0.1):
         """Constructor
 
            Initialize object's private data.
 
            servername:
                Host name or IP address of host where remote server will run
+               [Default: None (run locally)]
            logfile:
                Pathname of log file to be created on remote host
-               [Default: "/dev/null"]
+               [Default: None]
+           sudo:
+               Run remote procedure server as root
+               [Default: False]
            sync_timeout:
                Timeout used for synchronizing the connection stream
                [Default: 0.1]
@@ -242,54 +245,78 @@ class Rexec(BaseObj):
         self.pid     = None
         self.conn    = None
         self.process = None
+        self.remote  = False
+        self.servername   = servername
+        self.logfile      = logfile
+        self.sudo         = sudo
         self.sync_timeout = sync_timeout
-        if logfile is None:
-            # Default log file
-            logfile = "/dev/null"
-        if servername in ["", "localhost", "127.0.0.1"]:
-            # Start bare-bones server locally
-            self.remote = False
+        if os.getuid() == 0:
+            # Already running as root
+            self.sudo = True
+            sudo = False
+
+        if not sudo and servername in [None, "", "localhost", "127.0.0.1"]:
+            # Start remote server locally via fork when sudo is not set
+            servername = ""
             self.pid = os.fork()
             if self.pid == 0:
                 # This is the child process
-                bare_server(PORT, logfile)
+                RemoteServer(PORT, self.logfile).start()
                 os._exit(0)
         else:
-            # Start bare-bones server on remote host
-            self.remote = True
-            server_code = "".join(inspect.getsourcelines(bare_server)[0])
-            server_code += 'bare_server(%d, "%s")' % (PORT, logfile)
-            server_code = re.sub(r"'", r"\\'", server_code)
-            cmdlist = ["ssh", "-t", servername, "python -c '%s'" % server_code]
-            self.process = Popen(cmdlist, shell=False, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+            # Start server on remote host or locally if sudo is set
+            server_code  = IMPORTS
+            server_code += "".join(inspect.getsourcelines(RemoteServer)[0])
+            server_code += "RemoteServer(%d, %r).start()\n" % (PORT, self.logfile)
+            # Execute minimal python script to execute the source code
+            # given in standard input
+            pysrc = "import sys; exec(sys.stdin.read(%d))" % len(server_code)
+            cmdlist = ["python", "-c", repr(pysrc)]
+
+            if sudo:
+                cmdlist.insert(0, "sudo")
+
+            if servername not in [None, "", "localhost", "127.0.0.1"]:
+                # Run remote process via ssh
+                cmdlist = ["ssh", servername] + cmdlist
+                self.process = Popen(cmdlist, shell=False, stdin=PIPE)
+                self.remote = True
+            else:
+                # Run local process via the shell
+                servername = ""
+                self.process = Popen(" ".join(cmdlist), shell=True, stdin=PIPE)
+
+            # Send the server code to be executed via standard input
+            self.process.stdin.write(server_code)
 
         # Connect to remote server
         address = (servername, PORT)
         self.conn = Client(address)
         PORT += 1
 
-        # Execute main server on remote host
-        proc_code  = "".join(inspect.getsourcelines(write_log)[0])
-        proc_code += "".join(inspect.getsourcelines(proc_requests)[0])
-        proc_code += "proc_requests(fd, conn)"
-        self.conn.send(proc_code)
-
     def __del__(self):
         """Destructor"""
+        self.close()
+
+    def close(self):
+        """Close connection to remote server"""
         if self.conn:
             # Send command to exit main loop
-            self.conn.send('close')
+            self.conn.send("close")
             self.conn.close()
+            self.conn = None
         # Wait for remote server to finish
         if self.pid:
             os.waitpid(self.pid, 0)
+            self.pid = None
         elif self.process:
             self.process.wait()
+            self.process = None
 
     def _send_cmd(self, cmd, *kwts, **kwds):
         """Internal method to send commands to remote server"""
-        nowait = kwds.pop('NOWAIT', False)
-        self.conn.send({'cmd': cmd, 'kwts': kwts, 'kwds': kwds})
+        nowait = kwds.pop("NOWAIT", False)
+        self.conn.send({"cmd": cmd, "kwts": kwts, "kwds": kwds})
         if nowait:
             # NOWAIT option is specified, so return immediately
             # Use poll() method to check if any data is available
@@ -341,11 +368,11 @@ class Rexec(BaseObj):
 
     def rexec(self, expr):
         """Execute statement on remote server"""
-        return self._send_cmd('exec', expr)
+        return self._send_cmd("exec", expr)
 
     def reval(self, expr):
         """Evaluate expression on remote server"""
-        return self._send_cmd('eval', expr)
+        return self._send_cmd("eval", expr)
 
     def run(self, *kwts, **kwds):
         """Run function on remote server
@@ -354,7 +381,7 @@ class Rexec(BaseObj):
            All other positional arguments and any named arguments are treated
            as arguments to the function
         """
-        return self._send_cmd('run', *kwts, **kwds)
+        return self._send_cmd("run", *kwts, **kwds)
 
     def rcode(self, code):
         """Define function on remote server"""

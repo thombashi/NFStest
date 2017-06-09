@@ -1,0 +1,1602 @@
+#!/usr/bin/env python
+#===============================================================================
+# Copyright 2016 NetApp, Inc. All Rights Reserved,
+# contribution by Jorge Mora <mora@netapp.com>
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 2 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#===============================================================================
+import os
+import time
+import errno
+import ctypes
+import struct
+import traceback
+from formatstr import *
+import nfstest_config as c
+from baseobj import BaseObj
+from packet.nfs.nfs3_const import *
+from packet.nfs.nfs4_const import *
+from nfstest.test_util import TestUtil
+from fcntl import fcntl,F_RDLCK,F_WRLCK,F_SETLK
+from multiprocessing import Process,JoinableQueue
+
+# Module constants
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
+__copyright__ = "Copyright (C) 2016 NetApp, Inc."
+__license__   = "GPL v2"
+__version__   = "1.1"
+
+USAGE = """%prog --server <server> [options]
+
+Server side copy tests
+======================
+Verify correct functionality of server side copy
+
+Copying a file via NFS the client reads the data from the source file and
+then writes the same data to the destination file which is located in the
+same server or it could be located in a different server. Either way the
+file data is transferred twice, once for reading and the second for writing.
+Server side copy allows unnecessary network traffic to be eliminated.
+The intra-server copy allows the client to request the server to perform
+the copy internally thus avoiding any data being sent through the network
+at all. In the case for the inter-server copy where the destination server
+is different from the source server, the client authorizes both servers
+to interact directly with one another.
+
+The system call copy_file_range is used to send both intra and inter
+server side copy requests to the correct server.
+
+Basic server side copy tests verify the actual file range from the source
+file(s) are copied correctly to the destination file(s). Most tests deal
+with a single source and destination file while verifying the data is copied
+correctly. Also it verifies the data is copied starting from the correct
+source offset and it is copied to the correct offset on the destination file.
+Other tests deal with multiple files: copying multiple source files to a
+single destination file, a single source file to multiple destination files,
+or N number of source files to M number of destination files.
+
+Some tests include testing at the protocol level by taking a packet trace
+and inspecting the actual packets sent to the server or servers. For the
+intra-server side copy, these tests verify the COPY/CLONE operation is sent
+to the server with correct arguments. For the inter-server side copy, these
+tests verify the COPY_NOTIFY operation is sent to the source server with
+correct arguments to authorize the source server to allow the destination
+server to copy the data directly; then the client sends the COPY operation
+to the destination server so it could initiate the actual copy.
+
+The server side copy could either be synchronous or asynchronous depending
+on both client and server(s). The client could issue either a synchronous
+or asynchronous copy and the server could either copy the file data in either
+mode depending on implementation or other factors. In either case, the tests
+verify the correct functionality for both cases. The CB_OFFLOAD operation is
+used by the destination server to report the actual results of the copy when
+it is done. The client could also actively query the destination server for
+status on a current asynchronous copy using the OFFLOAD_STATUS operation.
+Also the client has a mechanism to cancel a given asynchronous copy using
+the OFFLOAD_CANCEL operation.
+
+Negative testing is included whenever possible since some testing cannot be
+done at the protocol level because the copy_file_range system call does some
+error checking of its own and the NFS client won't even send a COPY_NOTIFY
+or COPY operation to the server letting the server deal with the
+error. Negative tests include trying to copy an invalid source range, having
+an invalid value for either the offset or the length, trying to copy a region
+on a source file opened as write only, a destination file opened as read only
+or the file is a non-regular file type.
+
+Examples:
+    The only required option is --server
+    $ %prog --server 192.168.0.11
+
+Notes:
+    The user id in the local host and the host specified by --dst-server must
+    have access to run commands as root using the 'sudo' command without
+    the need for a password.
+
+    The user id must be able to 'ssh' to remote host without the need for
+    a password.
+
+    Valid only for NFS version 4.2 and above."""
+
+# Test script ID
+SCRIPT_ID = "SSC"
+
+DATA_PATTERN = "ABCDE"
+
+INTRA_TESTS = [
+    "intra01",
+    "intra02",
+    "intra03",
+    "intra04",
+    "intra05",
+    "intra06",
+    "intra07",
+    "intra08",
+    "intra09",
+    "intra10",
+    "intra11",
+    "intra12",
+    "intra13",
+    "intra14",
+    "intra15",
+]
+NINTRA_TESTS = ["intra09", "intra10", "intra11", "intra12", "intra13"]
+PINTRA_TESTS = list(sorted(set(INTRA_TESTS).difference(NINTRA_TESTS)))
+
+INTER_TESTS = [
+    "inter01",
+    "inter02",
+    "inter03",
+    "inter04",
+    "inter05",
+    "inter06",
+    "inter07",
+    "inter08",
+    "inter09",
+    "inter10",
+    "inter11",
+    "inter12",
+    "inter13",
+    "inter14",
+    "inter15",
+]
+NINTER_TESTS = ["inter09", "inter10", "inter11", "inter12"]
+PINTER_TESTS = list(sorted(set(INTER_TESTS).difference(NINTER_TESTS)))
+
+# Include the test groups in the list of test names
+# so they are displayed in the help
+TESTNAMES = ["intra", "pintra", "nintra"] + INTRA_TESTS + \
+            ["inter", "pinter", "ninter"] + INTER_TESTS + \
+            ["positive", "negative"]
+
+TESTGROUPS = {
+    "intra": {
+         "tests": INTRA_TESTS,
+         "desc": "Run all intra server side copy tests: ",
+    },
+    "pintra": {
+         "tests": PINTRA_TESTS,
+         "desc": "Run all positive intra server side copy tests: ",
+    },
+    "nintra": {
+         "tests": NINTRA_TESTS,
+         "desc": "Run all negative intra server side copy tests: ",
+    },
+    "inter": {
+         "tests": INTER_TESTS,
+         "desc": "Run all inter server side copy tests: ",
+    },
+    "pinter": {
+         "tests": PINTER_TESTS,
+         "desc": "Run all positive inter server side copy tests: ",
+    },
+    "ninter": {
+         "tests": NINTER_TESTS,
+         "desc": "Run all negative inter server side copy tests: ",
+    },
+    "positive": {
+         "tests": PINTRA_TESTS + PINTER_TESTS,
+         "desc": "Run all positive server side copy tests: ",
+    },
+    "negative": {
+         "tests": NINTRA_TESTS + NINTER_TESTS,
+         "desc": "Run all negative server side copy tests: ",
+    },
+}
+
+def ptr_contents(ptr):
+    """Return the contents of the ctypes pointer"""
+    if ptr is None:
+        return "NULL"
+    return ptr.contents.value
+
+def getlock(fd, lock_type, offset=0, length=0):
+    """Get byte range lock on file given by file descriptor"""
+    lockdata = struct.pack("hhllhh", lock_type, 0, offset, length, 0, 0)
+    out = fcntl(fd, F_SETLK, lockdata)
+    return struct.unpack("hhllhh", out)
+
+class FileObj(BaseObj):
+    """File object"""
+    _attrlist = ("fd", "filename", "absfile", "locktype", "filesize",
+                 "datarange", "filehandle", "stateid", "cstateid", "copyidx")
+    def __init__(self, **kwargs):
+        self.fd          = kwargs.get("fd")           # Open file descriptor
+        self.filename    = kwargs.get("filename")     # File name
+        self.absfile     = kwargs.get("absfile")      # Absolute path for file
+        self.locktype    = kwargs.get("locktype")     # Locking type
+        self.filesize    = kwargs.get("filesize", 0)  # File size
+        self.datarange   = kwargs.get("datarange")    # List of unmodified data ranges
+        self.filehandle  = kwargs.get("filehandle")   # File handle
+        self.stateid     = kwargs.get("stateid")      # Stateid for I/O operations
+        self.cstateid    = kwargs.get("cstateid")     # Stateid list used by COPY
+        self.copyidx     = kwargs.get("copyidx")      # COPY index where this file was used
+
+class CopyItem(BaseObj):
+    """Copy Item object"""
+    _attrlist = ("src_file", "src_offset", "src_lstid", "dst_file",
+                 "dst_offset", "dst_lstid", "ncount", "nbytes", "count",
+                 "copyid")
+    def __init__(self, **kwargs):
+        self.src_file    = kwargs.get("src_file")     # Source FileObj
+        self.src_offset  = kwargs.get("src_offset")   # Source offset of COPY
+        self.src_lstid   = kwargs.get("src_lstid")    # Source lock stateid
+        self.src_off     = kwargs.get("src_off")      # Source offset modified by COPY
+        self.src_tell    = kwargs.get("src_tell")     # Source offset position after COPY
+        self.dst_file    = kwargs.get("dst_file")     # Destination FileObj
+        self.dst_offset  = kwargs.get("dst_offset")   # Destination offset of COPY
+        self.dst_lstid   = kwargs.get("dst_lstid")    # Destination lock stateid
+        self.dst_off     = kwargs.get("dst_off")      # Destination offset modified by COPY
+        self.dst_tell    = kwargs.get("dst_tell")     # Destination offset position after COPY
+        self.locking     = kwargs.get("locking")      # Locking is used if set
+        self.ncount      = kwargs.get("ncount")       # Locking length
+        self.nbytes      = kwargs.get("nbytes")       # Number of bytes to copy
+        self.count       = kwargs.get("count")        # Number of bytes returned by copy
+        self.copyid      = kwargs.get("copyid")       # Callback id from async COPY
+        self.errorno     = kwargs.get("errorno")      # Error number return from COPY
+
+    def file_locks(self):
+        """Lock the source and destination files"""
+        if self.locking:
+            self.dprint("DBG4", "Lock  source file      %s %d@%d" % (self.src_file.absfile, self.ncount, self.src_offset))
+            getlock(self.src_file.fd, self.src_file.locktype, self.src_offset, self.ncount)
+            self.dprint("DBG4", "Lock  destination file %s %d@%d" % (self.dst_file.absfile, self.ncount, self.dst_offset))
+            getlock(self.dst_file.fd, self.dst_file.locktype, self.dst_offset, self.ncount)
+
+class SSCTest(TestUtil):
+    """SSCTest object
+
+       SSCTest() -> New test object
+
+       Usage:
+           x = SSCTest(testnames=["intra01", "intra02", "intra03", ...])
+
+           # Run all the tests
+           x.run_tests()
+           x.exit()
+    """
+    def __init__(self, **kwargs):
+        """Constructor
+
+           Initialize object's private data.
+        """
+        self.dst = None          # Host object to mount the destination server
+        self.queue = None        # Inter-processes queue
+        self.copyitems = []      # List of CopyItem objects
+        self.server_list = []    #  List of destination server host objects
+        self.remove_dstlist = [] # List of files to be removed at cleanup
+
+        # Instantiate base object constructor
+        TestUtil.__init__(self, **kwargs)
+        self.opts.version = "%prog " + __version__
+        # Tests are valid for NFSv4.2 and beyond
+        self.opts.set_defaults(nfsversion=4.2)
+
+        # Options specific for this test script
+        hmsg = "Destination server for inter server side copy [default: %default]"
+        self.test_opgroup.add_option("--dst-server", default=None, help=hmsg)
+        hmsg = "Destination export for inter server side copy [default: %default]"
+        self.test_opgroup.add_option("--dst-export", default=None, help=hmsg)
+        hmsg = "Number of concurrent copies to use on intra14 and inter14 tests [default: %default]"
+        self.test_opgroup.add_option("--ncopies", type="int", default=4, help=hmsg)
+        hmsg = "Number of source files to use concurrently on intra15 and inter15 tests [default: %default]"
+        self.test_opgroup.add_option("--src-files", type="int", default=3, help=hmsg)
+        hmsg = "Number of destination files to use concurrently on intra15 and inter15 tests [default: %default]"
+        self.test_opgroup.add_option("--dst-files", type="int", default=2, help=hmsg)
+        hmsg = "Write destination file before copy_file_range [default: %default]"
+        self.test_opgroup.add_option("--pre-write", type="int", default=1, help=hmsg)
+        hmsg = "Lock files [default: %default]"
+        self.test_opgroup.add_option("--locks", type="int", default=1, help=hmsg)
+
+        self.scan_options()
+
+        # XXX Set correct copy_file_range system call number since
+        # copy_file_range has no wrapper function in libc yet
+        arch = os.uname()[4]
+        if arch == "x86_64":
+            self.NR_copy_file_range = 326
+        elif arch == "x86_32":
+            self.NR_copy_file_range = 377
+        else:
+            self.config("Machine architecture not supported: %s" % arch)
+
+        # For tests copying data starting from a non-zero source offset,
+        # copy the bytes right up to the end of the source file
+        self.s_offset = self.filesize/2
+        self.s_nbytes = self.filesize - self.s_offset
+
+        # Remove all INTER-SSC tests if dst-server is not given
+        # and requested to run all tests or either positive or negative tests
+        if self.dst_server is None and self.runtest in ("all", "positive", "negative"):
+            for tname in INTER_TESTS:
+                if tname in self.testlist:
+                    self.testlist.remove(tname)
+
+        # Find if there is at least one INTER-SSC test to run
+        inter_ssc = bool(set(self.testlist).intersection(INTER_TESTS))
+
+        if inter_ssc and self.dst_server is None:
+            self.opts.error("option dst-server is required for inter-ssc tests")
+
+        if inter_ssc and self.dst_server is not None:
+            if self.dst_export is None:
+                self.opts.error("option dst-export is required when dst-server is given")
+            mtpoint = self.mtpoint + "_dst"
+            self.dst = self.create_host("", server=self.dst_server, export=self.dst_export, mtpoint=mtpoint)
+            ipv6 = self.proto[-1] == "6"
+            self.dst.server_ipaddr = self.get_ip_address(host=self.dst_server, ipv6=ipv6)
+            dst_srv = self.create_host(self.dst_server)
+            self.server_list.append(dst_srv)
+
+        # Disable createtraces option but save it first for tests that do not
+        # check the NFS packets to verify the assertion
+        self._createtraces = self.createtraces
+        self.createtraces = False
+
+        #XXX Use syscall until copy_file_range is in libc
+        self.libc.syscall.restype  = ctypes.c_longlong
+        self.libc.syscall.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_longlong),
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_longlong),
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+
+    def copy_file_range(self, srcfd, srcoff, dstfd, dstoff, count, flags):
+        """Wrapper for copy_file_range system call since it is not yet in libc"""
+        return self.libc.syscall(self.NR_copy_file_range, srcfd, srcoff, dstfd, dstoff, count, flags)
+
+    def setup(self):
+        """Setup test environment"""
+        nfiles = 1
+        file_list = []
+        run_set = set(self.testlist)
+
+        # Get correct number of source files to create
+        if run_set.intersection(["intra10"]):
+            nfiles = 2
+        if run_set.intersection(["intra15", "inter15"]):
+            nfiles = max(nfiles, self.src_files)
+
+        # Call base object's setup method
+        super(SSCTest, self).setup(nfiles=nfiles)
+
+        # Create necessary files in the destination server
+        if run_set.intersection(["inter10"]):
+            while len(self.files) < 2:
+                self.get_filename()
+            file_list.append(self.files[1])
+        if self.dst and file_list:
+            self.dst.umount()
+            self.dst.mount()
+            for filename in file_list:
+                dstfile = self.dst.abspath(filename)
+                self.remove_dstlist.append(dstfile)
+                self.dprint("DBG3", "Creating file [%s] %d@%d" % (dstfile, self.filesize, 0))
+                fd = os.open(dstfile, os.O_WRONLY|os.O_CREAT|os.O_TRUNC)
+                self.write_data(fd)
+                os.close(fd)
+            self.dst.umount()
+
+    def cleanup(self, **kwargs):
+        """Setup test environment"""
+        # Save nocleanup since it will be modified by the base object's
+        # cleanup method in order to cleanup just once
+        nocleanup = self.nocleanup
+        super(SSCTest, self).cleanup(**kwargs)
+
+        if self.dst and not nocleanup and self.remove_dstlist:
+            # Cleanup the destination server
+            self.dst.mount()
+            for absfile in reversed(self.remove_dstlist):
+                try:
+                    if os.path.exists(absfile):
+                        self.dprint("DBG5", "    Removing file [%s]" % absfile)
+                        os.unlink(absfile)
+                except:
+                    pass
+            # Make sure cleanup is called just once
+            self.dst = None
+
+    def copy_list(self):
+        """Generator to yield all CopyItem objects"""
+        for item in self.copyitems:
+            yield item
+
+    def src_file_list(self):
+        """Generator to yield all source FileObj objects"""
+        flist = []
+        for item in self.copyitems:
+            src_file = item.src_file
+            if src_file not in flist:
+                flist.append(src_file)
+                yield src_file
+
+    def dst_file_list(self):
+        """Generator to yield all destination FileObj objects"""
+        flist = []
+        for item in self.copyitems:
+            dst_file = item.dst_file
+            if dst_file not in flist:
+                flist.append(dst_file)
+                yield dst_file
+
+    def src_get_file(self, index):
+        """Get the source FileObj given by the index"""
+        for item in self.src_file_list():
+            if index == 0:
+                return item
+            index -= 1
+        return
+
+    def dst_get_file(self, index):
+        """Get the destination FileObj given by the index"""
+        for item in self.dst_file_list():
+            if index == 0:
+                return item
+            index -= 1
+        return
+
+    def close_files(self):
+        """Close all opened files"""
+        for item in list(self.src_file_list()) + list(self.dst_file_list()):
+            if item.fd:
+                os.close(item.fd)
+                item.fd = None
+
+    def find_v3_open(self, filename, dirfh=None, **kwargs):
+        """Find the call and its corresponding reply for the NFSv3 OPEN of the
+           given file going to the server specified by the ipaddr and port.
+        """
+        save_index = self.pktt.get_index()
+        mstr = "nfs.name == '%s'" % filename
+        if dirfh is not None:
+            mstr = "crc32(nfs.fh) == %d and " % crc32(dirfh) + mstr
+        (pktcall, pktreply) = self.find_nfs_op(NFSPROC3_LOOKUP, ipaddr=kwargs["ipaddr"], port=kwargs["port"], match=mstr)
+        if pktcall is None:
+            self.pktt.rewind(save_index)
+            (pktcall, pktreply) = self.find_nfs_op(NFSPROC3_CREATE, ipaddr=kwargs["ipaddr"], port=kwargs["port"], match=mstr)
+        self.opencall  = pktcall
+        self.openreply = pktreply
+        if pktreply:
+            self.filehandle = pktreply.nfs.fh
+
+    def pkt_locks(self, fhandle, **kwargs):
+        """Search the packets for the lock stateid given by the file handle"""
+        kwargs["match"] = "crc32(nfs.fh) == %d" % crc32(fhandle)
+        self.find_nfs_op(OP_LOCK, **kwargs)
+        if self.pktreply:
+            self.pktt.rewind(self.pktcall.record.index+1)
+            return self.pktreply.NFSop.stateid.other
+
+    def get_io(self, op):
+        """Search all packets for given I/O operation and return
+           a dictionary where the key is the file handle and the
+           value is the index of the last packet found
+        """
+        index_map = {}
+        self.pktt.rewind()
+        if self.nfsversion < 4:
+            if op == OP_READ:
+                op = NFSPROC3_READ
+            elif op == OP_WRITE:
+                op = NFSPROC3_WRITE
+        mstr = "nfs.argop == %d" % op
+        while self.pktt.match(mstr):
+            index = self.pktt.get_index()
+            fhandle = self.pktt.pkt.NFSop.fh
+            if index_map.get(fhandle) is None:
+                index_map[fhandle] = index
+            else:
+                index_map[fhandle] = max(index, index_map[fhandle])
+        return index_map
+
+    def run_copy_file_range(self, tid):
+        """Run copy_file_range in a different process"""
+        try:
+            copyobj = self.copyitems[tid]
+            nbytes  = copyobj.nbytes
+            srcoff  = copyobj.src_offset
+            dstoff  = copyobj.dst_offset
+            sname   = copyobj.src_file.filename
+            dname   = copyobj.dst_file.filename
+            errstr  = ""
+            errorno = None
+            src_off = None
+            dst_off = None
+
+            # Lock both source and destination files
+            copyobj.file_locks()
+            soff = ctypes.pointer(ctypes.c_longlong(srcoff))
+            doff = ctypes.pointer(ctypes.c_longlong(dstoff))
+            self.dprint("DBG3", "COPY %s -> %s with size = %d, offset(%s -> %s) (%d)" % (sname, dname, nbytes, srcoff, dstoff, tid))
+            count = self.copy_file_range(copyobj.src_file.fd, soff, copyobj.dst_file.fd, doff, nbytes, 0)
+            if count == -1:
+                errorno = ctypes.get_errno()
+                errstr = " [%s]" % errno.errorcode.get(errorno, errorno)
+            src_tell = os.lseek(copyobj.src_file.fd, 0, os.SEEK_CUR)
+            dst_tell = os.lseek(copyobj.dst_file.fd, 0, os.SEEK_CUR)
+            src_off = ptr_contents(soff)
+            dst_off = ptr_contents(doff)
+            self.dprint("DBG4", "COPY returns %d%s (soff:%s, doff:%s) (spos:%d, dpos:%d) (%d)" % (count, errstr, src_off, dst_off, src_tell, dst_tell, tid))
+        except:
+            self.queue.put([tid, 1, traceback.format_exc()])
+            return 1
+        self.queue.put([tid, 0, count, src_off, src_tell, dst_off, dst_tell, errorno])
+        return 0
+
+    def basic_ssc(self, **kwargs):
+        """Basic server side copy test"""
+        # When using src_seek set src_off to None (NULL value on copy_file_range)
+        # When using dst_seek set dst_off to None (NULL value on copy_file_range)
+        count    = None     # Number of bytes returned by copy_file_range
+        srcoff   = None     # C style pointer to source offset (None -> NULL)
+        dstoff   = None     # C style pointer to destination offset (None -> NULL)
+        srclock  = F_WRLCK  # Source lock type
+        dstlock  = F_WRLCK  # Destination lock type
+        errorno  = 0  # Error number if copy_file_range fails
+        nbytes   = kwargs.get("nbytes", self.filesize) # Number of bytes to copy
+        srcopen  = kwargs.get("srcopen", os.O_RDONLY) # Open mode for source file
+        dstopen  = kwargs.get("dstopen", os.O_WRONLY|os.O_CREAT) # Open mode for destination file
+        src_off  = kwargs.get("src_off", 0)  # Source offset to use in copy_file_range
+        dst_off  = kwargs.get("dst_off", 0)  # Destination offset to use in copy_file_range
+        src_seek = kwargs.get("src_seek", 0) # Source offset to seek to before copy_file_range
+        dst_seek = kwargs.get("dst_seek", 0) # Destination offset to seek to before copy_file_range
+        failure  = kwargs.get("failure", 0)  # Error number of expected failure
+        dstfail  = kwargs.get("dstfail", 0)  # Failure is caused by the destination file
+        copymsg  = kwargs.get("copymsg", "") # Specific assertion message on COPY success test
+        write    = kwargs.get("write", self.pre_write) # Write before copy_file_range
+        inter    = kwargs.get("inter", 0)    # Inter-server side copy test when True(1)
+        src_doff = kwargs.get("src_doff", 0) # Use multiple source offsets when True(1)
+        ncopies  = kwargs.get("ncopies", 1)  # Number of copies to start concurrently
+        nsfiles  = kwargs.get("nsfiles", 1)  # Number of source files to use concurrently
+        ndfiles  = kwargs.get("ndfiles", 1)  # Number of destination files to use concurrently
+        samefile = kwargs.get("samefile", 0) # Use same file name for both source and destination
+
+        # Get the correct number of copies the client will send
+        ncopies = max(ncopies, max(nsfiles, ndfiles))
+
+        if failure:
+            # Expecting a failure
+            ncopies = 1
+
+        if srcopen & os.O_WRONLY:
+            srcostr = "writing"
+        elif srcopen & os.O_RDWR:
+            srcostr = "read and write"
+        else:
+            srcostr = "reading"
+            srclock = F_RDLCK
+
+        if dstopen & os.O_WRONLY:
+            dstostr = "writing"
+        elif dstopen & os.O_RDWR:
+            dstostr = "read and write"
+        else:
+            dstostr = "reading"
+            dstlock = F_RDLCK
+
+        if dstfail:
+            openstr = dstostr
+            strfile = "destination"
+        else:
+            openstr = srcostr
+            strfile = "source"
+
+        # Convert source and destination offsets to C style pointers
+        # as needed by copy_file_range
+        if src_off is None:
+            src_offset = src_seek
+        else:
+            src_offset = src_off
+            srcoff = ctypes.pointer(ctypes.c_longlong(src_off))
+        if dst_off is None:
+            dst_offset = dst_seek
+        else:
+            dst_offset = dst_off
+            dstoff = ctypes.pointer(ctypes.c_longlong(dst_off))
+
+        # Number of bytes expected to be copied
+        ncount = nbytes - max(src_offset + nbytes - self.filesize, 0)
+
+        # Unmount the source and destination
+        self.umount()
+        if inter and self.dst:
+            self.dst.umount()
+
+        # Start packet trace
+        self.trace_start(clients=[])
+
+        # Mount source
+        self.mount()
+        if inter and self.dst:
+            # Mount destination
+            self.dst.mount()
+
+        try:
+            ####################################################################
+            # Main test
+            ####################################################################
+            # Destination file
+            if samefile:
+                dstname = self.files[0]
+            elif dstostr == "reading":
+                dstname = self.files[1]
+                # Do not try to write any data before the copy_file_range
+                write = 0
+            else:
+                # Get a new name
+                dstname = None
+
+            sindex = 0 # Index for source file
+            dindex = 0 # Index for destination file
+            smult  = 0 # Multiplier for source offset
+            dmult  = 0 # Multiplier for destination offset
+            fsize  = 0 # Initial file size of destination file
+            if write:
+                fsize = self.filesize
+
+            # Create list of copy objects
+            self.copyitems = []
+            for i in range(ncopies):
+                # Source file
+                srcobj = self.src_get_file(sindex)
+                if srcobj is None:
+                    # Create FileObj for source file
+                    src_name = self.files[sindex]
+                    srcobj = FileObj(
+                        filename = src_name,
+                        absfile  = self.abspath(src_name),
+                        locktype = srclock,
+                        filesize = self.filesize,
+                    )
+
+                # Destination file
+                dstobj = self.dst_get_file(dindex)
+                if dstobj is None:
+                    if dstname is None:
+                        self.get_filename()
+                        dst_name = self.filename
+                    else:
+                        dst_name = dstname
+                    if inter and self.dst:
+                        dst_file = self.dst.abspath(dst_name)
+                        if dstname is None:
+                            self.remove_dstlist.append(dst_file)
+                    else:
+                        dst_file = self.abspath(dst_name)
+                    # Create FileObj for destination file
+                    dstobj = FileObj(
+                        filename = dst_name,
+                        absfile  = dst_file,
+                        locktype = dstlock,
+                        filesize = fsize,
+                    )
+
+                # Create CopyItem object
+                copyobj = CopyItem(
+                    src_file   = srcobj,
+                    src_offset = src_offset + smult*ncount,
+                    dst_file   = dstobj,
+                    dst_offset = dst_offset + dmult*ncount,
+                    nbytes     = nbytes,
+                    ncount     = ncount,
+                    locking    = self.locks,
+                )
+                # Add the CopyItem to the copyitems list
+                self.copyitems.append(copyobj)
+                sindex += 1
+                if sindex >= nsfiles:
+                    # Wrap around and start with the first source file
+                    if src_doff:
+                        smult += 1
+                    sindex = 0
+                dindex += 1
+                if dindex >= ndfiles:
+                    # Wrap around and start with the first destination file
+                    dmult += 1
+                    dindex = 0
+
+            # Open source files
+            for srcobj in self.src_file_list():
+                self.dprint("DBG3", "Open  source file      %s for %s" % (srcobj.absfile, srcostr))
+                srcobj.fd = os.open(srcobj.absfile, srcopen)
+                if src_seek > 0:
+                    self.dprint("DBG3", "Seek  source file      %s to offset %s" % (srcobj.absfile, src_seek))
+                    os.lseek(srcobj.fd, src_seek, os.SEEK_SET)
+
+            # Open destination files
+            for dstobj in self.dst_file_list():
+                self.dprint("DBG3", "Open  destination file %s for %s" % (dstobj.absfile, dstostr))
+                dstobj.fd = os.open(dstobj.absfile, dstopen)
+
+                if write:
+                    # Writing file before copy_file_range
+                    self.dprint("DBG3", "Write destination file %s %d@%d" % (dstobj.absfile, self.filesize, 0))
+                    self.write_data(dstobj.fd, pattern=DATA_PATTERN)
+                if dst_seek > 0:
+                    self.dprint("DBG3", "Seek  destination file %s to offset %s" % (dstobj.absfile, dst_seek))
+                    os.lseek(dstobj.fd, dst_seek, os.SEEK_SET)
+                else:
+                    os.lseek(dstobj.fd, 0, os.SEEK_SET)
+
+            # Flush log file descriptor to make sure debug info is not written
+            # multiple times to the log file
+            self.flush_log()
+
+            # Start all copies concurrently
+            # all copies but the first are executed in their own processes
+            pid_list = []
+            process_list = []
+            self.queue = JoinableQueue()
+            for i in range(1, ncopies):
+                process = Process(target=self.run_copy_file_range, args=(i,))
+                process_list.append(process)
+                process.start()
+
+            # The first copy is executed in the main process
+            errstr = ""
+            copyobj = self.copyitems[0]
+            copyobj.file_locks()
+            sname = copyobj.src_file.filename
+            dname = copyobj.dst_file.filename
+            self.dprint("DBG3", "COPY %s -> %s with size = %d, offset(%s -> %s)" % (sname, dname, copyobj.nbytes, copyobj.src_offset, dst_off))
+            count = self.copy_file_range(copyobj.src_file.fd, srcoff, copyobj.dst_file.fd, dstoff, copyobj.nbytes, 0)
+            if count == -1:
+                errorno = ctypes.get_errno()
+                errstr = " [%s]" % errno.errorcode.get(errorno, errorno)
+            s_off = ptr_contents(srcoff)
+            d_off = ptr_contents(dstoff)
+            src_tell = os.lseek(copyobj.src_file.fd, 0, os.SEEK_CUR)
+            dst_tell = os.lseek(copyobj.dst_file.fd, 0, os.SEEK_CUR)
+            self.dprint("DBG4", "COPY returns %d%s off(src:%s, dst:%s) pos(src:%d, dst:%d)" % (count, errstr, s_off, d_off, src_tell, dst_tell))
+            copyobj.count    = count
+            copyobj.src_off  = s_off
+            copyobj.dst_off  = d_off
+            copyobj.src_tell = src_tell
+            copyobj.dst_tell = dst_tell
+            copyobj.errorno  = errorno
+
+            # Get the results from the child processes
+            ret_list = []
+            while len(ret_list) < len(process_list):
+                time.sleep(0.1)
+                while not self.queue.empty():
+                    # Get any pending messages from any of the processes
+                    data = self.queue.get()
+                    ret_list.append(data)
+
+            # Wait for all child processes to finish
+            for process in process_list:
+                if not process.is_alive():
+                    process.join()
+                    if len(process_list) == 0:
+                        break
+
+            for data in ret_list:
+                # Inter-process message format is a list:
+                # [thread_id, msg_type, message]
+                #   thread_id: 1-N (0 is reserved for main process)
+                #   msg_type:  0(success/errno), 1(unknown error)
+                if data[1] == 0:
+                    # Success/errno
+                    self.copyitems[data[0]].count    = data[2]
+                    self.copyitems[data[0]].src_off  = data[3]
+                    self.copyitems[data[0]].src_tell = data[4]
+                    self.copyitems[data[0]].dst_off  = data[5]
+                    self.copyitems[data[0]].dst_tell = data[6]
+                    self.copyitems[data[0]].errorno  = data[7]
+                elif data[1] == 1:
+                    # Unexpected error on child process
+                    raise Exception(data[2])
+
+            if copymsg:
+                # Specific assertion message
+                msg = copymsg
+            else:
+                # Default assertion message
+                msg = "%s file is opened for %s" % (strfile, openstr)
+
+            for copyobj in self.copy_list():
+                count   = copyobj.count
+                errorno = copyobj.errorno
+                if failure:
+                    # Expecting a failure
+                    errstr = errno.errorcode.get(failure, "errno=%d"%failure)
+                    if count == -1:
+                        fmsg = ", expecting %s but got %s" % (errstr, errno.errorcode.get(errorno, errorno))
+                    else:
+                        failure = 0 # The copy succeeded so test the results
+                        fmsg = ", expecting %s but it succeeded" % errstr
+                    self.test(count == -1 and errorno == failure, "COPY(copy_file_range) should fail with %s when %s" % (errstr, msg), failmsg=fmsg)
+                else:
+                    # Expecting a success
+                    fmsg = ", failed with %s" % errno.errorcode.get(errorno, errorno)
+                    self.test(count >= 0, "COPY(copy_file_range) should succeed when %s" % msg, failmsg=fmsg)
+                    if count >= 0:
+                        fmsg = ", expecting <= %s but got %s" % (copyobj.nbytes, count)
+                        self.test(count <= copyobj.nbytes, "COPY(copy_file_range) should return correct number of bytes actually copied", failmsg=fmsg)
+
+                    if count < 0:
+                        # Make sure expected offsets or offset position is correct
+                        count = 0
+
+                    # Source assertions
+                    src_offpos = src_seek
+                    if isinstance(copyobj.src_off, str) and copyobj.src_off == "NULL":
+                        # File descriptor is only modified if using a NULL pointer
+                        src_offpos += count
+                    else:
+                        # Offset pointer is modified
+                        src_exp_off = copyobj.src_offset + count
+                        fmsg = ", expecting %d but got %d" % (src_exp_off, copyobj.src_off)
+                        self.test(src_exp_off == copyobj.src_off, "Source offset pointer should be correct after copy_file_range", failmsg=fmsg)
+                    fmsg = ", expecting %d but got %d" % (src_offpos, copyobj.src_tell)
+                    self.test(src_offpos == copyobj.src_tell, "Source file descriptor offset position should be correct after copy_file_range", failmsg=fmsg)
+
+                    # Destination assertions
+                    dst_offpos = dst_seek
+                    if isinstance(copyobj.dst_off, str) and copyobj.dst_off == "NULL":
+                        # File descriptor is only modified if using a NULL pointer
+                        dst_offpos += count
+                    else:
+                        # Offset pointer is modified
+                        dst_exp_off = copyobj.dst_offset + count
+                        fmsg = ", expecting %d but got %d" % (dst_exp_off, copyobj.dst_off)
+                        self.test(dst_exp_off == copyobj.dst_off, "Destination offset pointer should be correct after copy_file_range", failmsg=fmsg)
+                    fmsg = ", expecting %d but got %d" % (dst_offpos, copyobj.dst_tell)
+                    self.test(dst_offpos == copyobj.dst_tell, "Destination file descriptor offset position should be correct after copy_file_range", failmsg=fmsg)
+        except Exception:
+            self.test(False, traceback.format_exc())
+        finally:
+            self.close_files()
+            self.trace_stop()
+
+        try:
+            ####################################################################
+            # Verify written data by copy_file_range
+            ####################################################################
+            if failure or errorno or count is None:
+                # No need to check anything else.
+                # This will execute corresponding finally block and then return
+                return
+
+            # Get expected destination file size
+            for copyobj in self.copy_list():
+                dstobj = copyobj.dst_file
+                dstobj.filesize = max(dstobj.filesize, copyobj.dst_offset + copyobj.count)
+
+            for copyobj in self.copy_list():
+                srcobj = copyobj.src_file
+                dstobj = copyobj.dst_file
+                dst_offset = copyobj.dst_offset
+
+                # Ranges of unmodified data -- start with full file
+                if dstobj.datarange is None:
+                    dstobj.datarange = [[0, dstobj.filesize]]
+                if copyobj.count <= 0:
+                    continue
+
+                try:
+                    # Find out which file ranges were not modified by the copy
+                    rindex = 0
+                    for rng in dstobj.datarange:
+                        rindex += 1
+                        if dst_offset >= rng[0] and dst_offset < rng[0] + rng[1]:
+                            # Split the range
+                            lcnt = rng[1]
+                            dstoff = dst_offset + copyobj.count
+                            if dst_offset == 0:
+                                rng[0] = dstoff
+                                rng[1] = max(0, lcnt - dstoff)
+                            elif rng[0] + dst_offset >= dstoff:
+                                rng[1] = max(0, lcnt - rng[0])
+                                rng[0] = dstoff
+                            else:
+                                rng[1] = dst_offset
+                                dstobj.datarange.insert(rindex, [dstoff, lcnt - dstoff])
+                            break
+
+                    if srcobj.fd is None:
+                        # Open source file to compare its data with the
+                        # destination file
+                        srcobj.fd = os.open(srcobj.absfile, os.O_RDONLY)
+                    if dstobj.fd is None:
+                        # Open destination file to compare its data with the
+                        # source file
+                        dstobj.fd = os.open(dstobj.absfile, os.O_RDONLY)
+                        dstst = os.fstat(dstobj.fd)
+                        fmsg = ", expecting file size = %d but got %d" % (dstobj.filesize, dstst.st_size)
+                        self.test(dstobj.filesize == dstst.st_size, "Destination file should have the correct size", failmsg=fmsg)
+                except Exception:
+                    self.test(False, traceback.format_exc())
+
+            for copyobj in self.copy_list():
+                srcobj = copyobj.src_file
+                dstobj = copyobj.dst_file
+                try:
+                    expr  = True
+                    soff  = copyobj.src_offset
+                    doff  = copyobj.dst_offset
+                    rsize = copyobj.count # Number of bytes to compare
+                    while rsize > 0:
+                        os.lseek(srcobj.fd, soff, os.SEEK_SET)
+                        os.lseek(dstobj.fd, doff, os.SEEK_SET)
+                        sdata = os.read(srcobj.fd, rsize)
+                        ddata = os.read(dstobj.fd, rsize)
+                        cnt = min(len(sdata), len(ddata))
+                        if sdata[:cnt] != ddata[:cnt]:
+                            expr = False
+                            break
+                        soff  += cnt
+                        doff  += cnt
+                        rsize -= cnt
+                    if rsize < copyobj.count:
+                        self.test(expr, "Destination file data written by COPY should be correct")
+                except Exception:
+                    self.test(False, traceback.format_exc())
+
+            if write:
+                # Verify destination file was not modified outside the
+                # file ranges from the copies
+                for dstobj in self.dst_file_list():
+                    expr = True
+                    if dstobj.fd is None:
+                        # File is not opened
+                        continue
+                    for drange in dstobj.datarange:
+                        # Verify data range was not modified
+                        doff = drange[0]
+                        moffset = doff + drange[1]
+                        while doff < moffset:
+                            rsize = moffset - doff
+                            os.lseek(dstobj.fd, doff, os.SEEK_SET)
+                            ddata = os.read(dstobj.fd, rsize)
+                            cnt = len(ddata)
+                            sdata = self.data_pattern(doff, cnt, DATA_PATTERN)
+                            if sdata != ddata:
+                                expr = False
+                                break
+                            doff += cnt
+                    self.test(expr, "Destination file data not written by COPY should not be modified")
+            self.close_files()
+        except Exception:
+            self.test(False, traceback.format_exc())
+        finally:
+            self.umount()
+            if inter and self.dst:
+                self.dst.umount()
+
+        try:
+            ####################################################################
+            # Verify correct packets are sent to server(s)
+            ####################################################################
+            copy_index = None
+            self.trace_open()
+            # Search some packets on source server
+            args = {"ipaddr": self.server_ipaddr, "port": self.port, "noreset":True}
+
+            # Save packets from mount command to use buffered matching
+            oplist = [OP_EXCHANGE_ID, OP_CREATE_SESSION, OP_PUTROOTFH, OP_CREATE, OP_LOOKUP, OP_SETCLIENTID]
+            self.set_pktlist(ops=oplist)
+
+            # Get attributes from mount packets (source server)
+            src_clientid  = self.get_clientid()
+            src_sessionid = self.get_sessionid(clientid=src_clientid)
+            src_rootfh    = self.get_rootfh(sessionid=src_sessionid)
+            src_export    = os.path.join(self.export, self.datadir)
+            src_topfh     = self.get_pathfh(src_export, dirfh=src_rootfh)
+
+            diff_server = False
+            if inter and self.dst:
+                # Get attributes from mount packets (destination server)
+                dst_ipaddr    = self.dst.server_ipaddr
+                dst_clientid  = self.get_clientid(ipaddr=dst_ipaddr)
+                dst_sessionid = self.get_sessionid(clientid=dst_clientid, ipaddr=None)
+                dst_rootfh    = self.get_rootfh(sessionid=dst_sessionid, ipaddr=None)
+                if dst_rootfh is not None:
+                    dst_ipaddr = self.pktcall.ip.dst
+                dst_export = os.path.join(self.dst_export, self.datadir)
+                dst_topfh  = self.get_pathfh(dst_export, dirfh=dst_rootfh)
+                args["fh"] = dst_topfh
+                if src_clientid is not None and dst_clientid is not None and src_clientid != dst_clientid:
+                    diff_server = True
+                if self.nfsversion < 4:
+                    #XXX how to check if two different servers on NFSv3?
+                    diff_server = True
+
+            # Disable buffered matching
+            self.pktt.set_pktlist()
+            self.pktt.rewind()
+
+            # Get list of operations to test and enable buffered matching
+            oplist = [OP_OPEN, OP_COPY, OP_COPY_NOTIFY, OP_CLONE, OP_LOCK, OP_COMMIT, OP_CLOSE, OP_ILLEGAL]
+            cblist = [OP_CB_OFFLOAD]
+            pclist = [NFSPROC3_LOOKUP, NFSPROC3_CREATE]
+            self.set_pktlist(ops=oplist, cbs=cblist, procs=pclist, pktdisp=self.pktdisp)
+
+            # Search all OPENs for the source files and get the correct
+            # stateid to use in I/O operations (COPY_NOTIFY or COPY)
+            open_index = 0
+            noreset = False
+            for srcobj in self.src_file_list():
+                self.get_stateid(srcobj.filename, noreset=noreset, fh=src_topfh)
+                if self.opencall is None:
+                    # Search NFSv3 packets
+                    self.find_v3_open(srcobj.filename, dirfh=src_topfh, **args)
+                # Save index right after the OPEN call
+                open_index = self.opencall.record.index + 1
+                noreset = True
+                srcobj.filehandle = self.filehandle
+                srcobj.stateid    = self.stateid
+                if inter and self.dst:
+                    srcobj.cstateid = []
+                else:
+                    srcobj.cstateid = [self.stateid]
+                save_index = self.pktt.get_index()
+                # Search for the correct source lock for each copy
+                while True:
+                    stateid = self.pkt_locks(self.filehandle, **args)
+                    if stateid is None:
+                        break
+                    for cobj in self.copy_list():
+                        off = self.pktcall.NFSop.offset
+                        if cobj.src_file == srcobj and cobj.src_offset == off:
+                            cobj.src_lstid = stateid
+                            break
+                self.pktt.rewind(save_index)
+
+            if inter and self.dst and diff_server:
+                # Inter server side copy -- look for COPY_NOTIFY
+                svrstr = "destination "
+                args["ipaddr"] = dst_ipaddr
+                args["port"]   = self.dst.port
+                for i in range(ncopies):
+                    (pktcall, pktreply) = self.find_nfs_op(OP_COPY_NOTIFY, status=None)
+                    if nbytes > 0 or pktcall:
+                        self.test(pktcall, "COPY_NOTIFY should be sent to source server")
+                    if pktcall:
+                        save_index = pktcall.record.index + 1
+                        stateid = pktcall.NFSop.stateid.other
+                        fhandle = pktcall.NFSop.fh
+
+                        if nsfiles == 1:
+                            srcobj = self.src_get_file(0)
+                            fmsg1 = ", expecting %s but got %s" % (self.stid_str(srcobj.stateid), self.stid_str(stateid))
+                            fmsg2 = ", expecting 0x%08x but got 0x%08x" % (crc32(srcobj.filehandle), crc32(fhandle))
+                        else:
+                            srcobj = None
+                            for srcobj in self.src_file_list():
+                                if srcobj.filehandle == fhandle:
+                                    break
+                            fmsg1 = ", expecting source stateid but got %s" % self.stid_str(stateid)
+                            fmsg2 = ", expecting source file handle but got 0x%08x" % crc32(fhandle)
+
+                        estateid = srcobj.stateid
+                        for copyobj in self.copy_list():
+                            if stateid == copyobj.src_lstid:
+                                estateid = copyobj.src_lstid
+                                break
+
+                        self.test(srcobj and stateid == estateid, "COPY_NOTIFY should be sent with correct stateid", failmsg=fmsg1)
+                        self.test(srcobj, "COPY_NOTIFY should be sent with correct source file handle", failmsg=fmsg2)
+
+                        if srcobj and pktreply:
+                            status = pktreply.NFSop.status
+                            fmsg = ", expecting NFS4_OK but got %s" % status
+                            self.test(status == NFS4_OK, "COPY_NOTIFY should succeed", failmsg=fmsg)
+                            if status != NFS4_OK:
+                                break
+
+                            # The COPY_NOTIFY stateid should be the source stateid in COPY
+                            # This operation does not have offsets so there is
+                            # no way to match it to the COPY operation exactly
+                            # thus the COPY_NOTIFY stateid is save in a list
+                            # to match the correct one on the COPY operation
+                            srcobj.cstateid.append(pktreply.NFSop.stateid.other)
+
+                        self.pktt.rewind(save_index)
+            else:
+                svrstr = ""
+
+            # Search all OPENs for the destination files and get the correct
+            # stateid to use in COPY
+            self.pktt.rewind(open_index)
+            for dstobj in self.dst_file_list():
+                self.get_stateid(dstobj.filename, **args)
+                if self.opencall is None:
+                    # Search NFSv3 packets
+                    self.find_v3_open(dstobj.filename, dirfh=src_topfh, **args)
+                dstobj.filehandle = self.filehandle
+                if self.stateid != self.lock_stateid:
+                    # Don't save the lock stateid in the FileObj
+                    # save it instead in the CopyItem object
+                    dstobj.stateid = self.stateid
+                save_index = self.pktt.get_index()
+                # Find correct destination lock stateid
+                while True:
+                    stateid = self.pkt_locks(self.filehandle, **args)
+                    if stateid is None:
+                        break
+                    for cobj in self.copy_list():
+                        off = self.pktcall.NFSop.offset
+                        if cobj.dst_file == dstobj and cobj.dst_offset == off:
+                            cobj.dst_lstid = stateid
+                            break
+                self.pktt.rewind(save_index)
+
+            # Verify COPY is sent to destination
+            cindex_list = range(ncopies)
+            save_index = self.pktt.get_index()
+            for i in range(ncopies):
+                clone = True
+                opstr = "CLONE"
+                self.pktt.rewind(save_index)
+                # The client may use the CLONE operation first
+                (pktcall, pktreply) = self.find_nfs_op(OP_CLONE, ipaddr=args["ipaddr"], port=args["port"], status=None)
+                if pktreply is None or pktreply.nfs.status != NFS4_OK:
+                    # No CLONE operation found or it failed, search for COPY
+                    self.pktt.rewind(save_index)
+                    (p_call, p_reply) = self.find_nfs_op(OP_COPY, ipaddr=args["ipaddr"], port=args["port"], status=None)
+                    if p_call is not None or pktcall is None:
+                        # The COPY operation was found or neither the COPY
+                        # or the CLONE operations were found
+                        clone    = False
+                        opstr    = "COPY"
+                        pktcall  = p_call
+                        pktreply = p_reply
+                if nbytes > 0 or pktcall:
+                    self.test(pktcall, "%s should be sent to %sserver" % (opstr, svrstr))
+                if pktcall:
+                    save_index  = pktcall.record.index + 1
+                    src_fhandle = pktcall.NFSop.sfh
+                    dst_fhandle = pktcall.NFSop.fh
+                    src_stateid = pktcall.NFSop.src_stateid.other
+                    dst_stateid = pktcall.NFSop.dst_stateid.other
+                    src_offset  = pktcall.NFSop.src_offset
+                    dst_offset  = pktcall.NFSop.dst_offset
+
+                    if copy_index is None:
+                        copy_index = pktcall.record.index
+                    else:
+                        copy_index = min(copy_index, pktcall.record.index)
+
+                    index = 0
+                    if ncopies == 1:
+                        # There should only be one copy so use the first object
+                        copyobj = self.copyitems[0]
+                        if len(copyobj.src_file.cstateid) > 0:
+                            cstateid = copyobj.src_file.cstateid[0]
+                        else:
+                            cstateid = copyobj.src_file.stateid
+                    else:
+                        copyobj = None
+                        # Get the correct copy object
+                        for item in self.copy_list():
+                            if item.src_file.filehandle == src_fhandle and \
+                               item.dst_file.filehandle == dst_fhandle and \
+                               item.src_offset == src_offset and \
+                               item.dst_offset == dst_offset:
+                                copyobj = item
+                                break
+                            index += 1
+                        # Get the correct source state id to use in COPY
+                        cstateid = copyobj.src_file.stateid
+                        for stateid in copyobj.src_file.cstateid:
+                            if stateid == src_stateid:
+                                cstateid = stateid
+                                break
+
+                    # Search the lock state ids for correct source state id
+                    for item in self.copy_list():
+                        if src_stateid == item.src_lstid:
+                            cstateid = item.src_lstid
+                            break
+
+                    if copyobj is None:
+                        # Expected COPY was not found, so use next available
+                        copyobj = self.copyitems[cindex_list.pop(0)]
+                    else:
+                        # Save the first COPY index to test the WRITEs are
+                        # sent before the COPY
+                        if copyobj.dst_file.copyidx is None:
+                            copyobj.dst_file.copyidx = pktcall.record.index
+                        else:
+                            copyobj.dst_file.copyidx = min(copyobj.dst_file.copyidx, pktcall.record.index)
+
+                    try:
+                        # Remove current copy index from list so when copyobj
+                        # is None the next available is used
+                        cindex_list.remove(index)
+                    except:
+                        pass
+
+                    fmsg = ", expecting 0x%08x but got 0x%08x" % (crc32(copyobj.src_file.filehandle), crc32(src_fhandle))
+                    self.test(src_fhandle == copyobj.src_file.filehandle, "%s should be sent with correct source file handle" % opstr, failmsg=fmsg)
+                    fmsg = ", expecting 0x%08x but got 0x%08x" % (crc32(copyobj.dst_file.filehandle), crc32(dst_fhandle))
+                    self.test(dst_fhandle == copyobj.dst_file.filehandle, "%s should be sent with correct destination file handle" % opstr, failmsg=fmsg)
+
+                    if copyobj.dst_lstid is None:
+                        dst_stid = copyobj.dst_file.stateid
+                    else:
+                        dst_stid = copyobj.dst_lstid
+                    fmsg = ", expecting %s but got %s" % (self.stid_str(cstateid), self.stid_str(src_stateid))
+                    self.test(src_stateid == cstateid, "%s should be sent with correct source stateid" % opstr, failmsg=fmsg)
+                    fmsg = ", expecting %s but got %s" % (self.stid_str(dst_stid), self.stid_str(dst_stateid))
+                    self.test(dst_stateid == dst_stid, "%s should be sent with correct destination stateid" % opstr, failmsg=fmsg)
+
+                    fmsg = ", expecting %s but got %s" % (copyobj.src_offset, src_offset)
+                    self.test(src_offset == copyobj.src_offset, "%s should be sent with correct source offset" % opstr, failmsg=fmsg)
+                    fmsg = ", expecting %s but got %s" % (copyobj.dst_offset, dst_offset)
+                    self.test(dst_offset == copyobj.dst_offset, "%s should be sent with correct destination offset" % opstr, failmsg=fmsg)
+                    fmsg = ", expecting %s but got %s" % (self.filesize, pktcall.NFSop.count)
+                    self.test(pktcall.NFSop.count == copyobj.nbytes, "%s should be sent with correct number of bytes to copy" % opstr, failmsg=fmsg)
+
+                    if pktreply:
+                        status = pktreply.NFSop.status
+                        fmsg = ", expecting NFS4_OK but got %s" % status
+                        self.test(status == NFS4_OK, "%s should succeed" % opstr, failmsg=fmsg)
+                        if status != NFS4_OK:
+                            if clone:
+                                # XXX If CLONE fails with NFS4ERR_NOTSUPP, expecting a COPY
+                                # XXX If CLONE fails with other than NFS4ERR_NOTSUPP???
+                                self.test(False, "COPY should be sent to %sserver when CLONE returns an error" % svrstr)
+                            return
+
+                        if not clone:
+                            expcount = None
+                            expr      = pktreply.NFSop.synchronous
+                            expcount  = pktreply.NFSop.count
+                            committed = pktreply.NFSop.committed
+                            verifier  = pktreply.NFSop.verifier
+                            if pktreply.NFSop.stateid is None:
+                                # This is a synchronous copy,
+                                # use results from the COPY reply
+                                opstr = "COPY"
+                                self.test(expr, "COPY should return synchronous=1 when no callback id is returned")
+                            else:
+                                # This is an asynchronous copy,
+                                # use results from the CB_OFFLOAD call
+                                opstr = "CB_OFFLOAD"
+                                copyobj.copyid = pktreply.NFSop.stateid
+                                self.test(not expr, "COPY should return synchronous=0 when a callback id is returned")
+
+                                # Rewind to after the COPY call because the
+                                # CB_OFFLOAD could come before the COPY reply
+                                self.pktt.rewind(pktcall.record.index + 1)
+
+                                # Look for CB_OFFLOAD to get the actual result of the COPY
+                                mstr = "crc16(nfs.stateid.other) == %d" % crc16(copyobj.copyid.other)
+                                (pktcall, pktreply) = self.find_nfs_op(OP_CB_OFFLOAD, ipaddr=self.client_ipaddr, port=None, match=mstr)
+                                self.test(pktcall, "CB_OFFLOAD should be sent by %sserver when COPY returns synchronous=0" % svrstr)
+                                if pktcall is not None:
+                                    ehandle = copyobj.dst_file.filehandle
+                                    fhandle = pktcall.NFSop.fh
+                                    fmsg = ", expecting 0x%08x but got 0x%08x" % (crc32(ehandle), crc32(fhandle))
+                                    self.test(ehandle == fhandle, "CB_OFFLOAD should return the correct file handle", failmsg=fmsg)
+                                    status   = pktcall.NFSop.status
+                                    expcount = pktcall.NFSop.count
+                                    if status == NFS4_OK or copyobj.count == 0:
+                                        fmsg = ", expecting NFS4_OK but got %s" % status
+                                        self.test(status == NFS4_OK, "CB_OFFLOAD should return the correct COPY status", failmsg=fmsg)
+                                    if status == NFS4_OK:
+                                        committed = pktcall.NFSop.committed
+                                        verifier  = pktcall.NFSop.verifier
+                                        cbid      = pktcall.NFSop.info.stateid
+                                        fmsg = ""
+                                        if cbid is not None:
+                                            fmsg = " but got 0x%04x" % crc16(cbid.other)
+                                        self.test(cbid is None, "CB_OFFLOAD should not return a callback id", failmsg=fmsg)
+                                    if pktreply:
+                                        status = pktreply.NFSop.status
+                                        fmsg = ", expecting NFS4_OK but got %s" % status
+                                        self.test(status == NFS4_OK, "CB_OFFLOAD should be replied by the client with correct status", failmsg=fmsg)
+                                    else:
+                                        self.test(False, "CB_OFFLOAD reply packet not found")
+
+                            if expcount is not None:
+                                fmsg = ", expecting %s but got %s" % (copyobj.count, expcount)
+                                self.test(expcount == copyobj.count, "%s should return correct number of bytes actually copied" % opstr, failmsg=fmsg)
+
+                                fmsg = ", expecting <= %s but got %s" % (copyobj.nbytes, expcount)
+                                self.test(expcount <= copyobj.nbytes, "%s should return at most the number of bytes requested" % opstr, failmsg=fmsg)
+
+                                mstr = "crc32(nfs.fh) == %d" % crc32(dst_fhandle)
+                                (pcall, preply) = self.find_nfs_op(OP_COMMIT, ipaddr=args["ipaddr"], port=args["port"], match=mstr)
+                                if committed == UNSTABLE4:
+                                    self.test(pcall, "COMMIT should be sent to %sserver when %s returns UNSTABLE4" % (svrstr, opstr))
+                                else:
+                                    self.test(not pcall, "COMMIT should not be sent to %sserver when %s does not return UNSTABLE4" % (svrstr, opstr))
+                                if preply:
+                                    expr = preply.NFSop.verifier == verifier
+                                    self.test(expr, "COMMIT should return the same verifier as the %s" % opstr)
+                                if pcall:
+                                    self.pktt.rewind(pcall.record.index + 1)
+                    else:
+                        self.test(False, "%s reply packet not found" % opstr)
+
+            # Disable buffered matching
+            self.pktt.set_pktlist()
+
+            if clone:
+                opstr = "CLONE"
+            else:
+                opstr = "COPY"
+
+            if copy_index is None and nbytes > 0:
+                # COPY/CLONE not sent by the client so verify system call
+                # falls back to copy the file(s) via the client
+                # Verify client sends the reads to the source server
+                if svrstr == "":
+                    svr_str = ""
+                else:
+                    svr_str = "source "
+                index_map = self.get_io(OP_READ)
+                for fhandle in index_map.keys():
+                    expr = False
+                    for copyobj in self.copy_list():
+                        if fhandle == copyobj.src_file.filehandle:
+                            expr = True
+                            break
+                    self.test(expr, "READs should be sent to %sserver when %s is not supported" % (svr_str, opstr))
+
+                # Verify client sends the writes to the destination server
+                index_map = self.get_io(OP_WRITE)
+                for fhandle in index_map.keys():
+                    expr = False
+                    for copyobj in self.copy_list():
+                        if fhandle == copyobj.dst_file.filehandle:
+                            expr = True
+                            break
+                    self.test(expr, "WRITEs should be sent to %sserver when %s is not supported" % (svrstr, opstr))
+            elif copy_index is not None:
+                # COPY/CLONE is sent by the client
+                if write:
+                    # Verify all WRITEs are sent before the COPY
+                    index_map = self.get_io(OP_WRITE)
+                    wcount = len(index_map)
+                    for fhandle in index_map.keys():
+                        index = index_map[fhandle]
+                        for copyobj in self.copy_list():
+                            if fhandle == copyobj.dst_file.filehandle:
+                                expr = wcount > 0 and index <= copyobj.dst_file.copyidx
+                                self.test(expr, "WRITEs should be sent to %sserver before the %s" % (svrstr, opstr))
+                                break
+
+                if inter and self.dst and diff_server:
+                    svrstr = "source "
+                else:
+                    svrstr = ""
+
+                self.pktt.rewind(copy_index)
+                self.find_nfs_op(OP_READ, src_ipaddr=self.client_ipaddr, call_only=1)
+                self.test(not self.pktt.pkt, "READs should not be sent to %sserver after the %s" % (svrstr, opstr))
+        except Exception:
+            self.test(False, traceback.format_exc())
+
+    #======================================================================
+    # INTRA Server Side Copy
+    #======================================================================
+    def intra01_test(self):
+        """Verify intra server side COPY succeeds"""
+        self.test_group("Verify intra server side COPY succeeds")
+        self.basic_ssc()
+
+    def intra02_test(self):
+        """Verify intra server side COPY succeeds when using source offset"""
+        self.test_group("Verify intra server side COPY succeeds when using source offset")
+        self.basic_ssc(src_off=self.s_offset, nbytes=self.s_nbytes)
+
+    def intra03_test(self):
+        """Verify intra server side COPY succeeds when using destination offset"""
+        self.test_group("Verify intra server side COPY succeeds when using destination offset")
+        self.basic_ssc(dst_off=self.filesize/2)
+
+    def intra04_test(self):
+        """Verify intra server side COPY succeeds when using NULL as source offset"""
+        self.test_group("Verify intra server side COPY succeeds when using NULL as source offset")
+        self.basic_ssc(src_off=None, src_seek=self.s_offset, nbytes=self.s_nbytes)
+
+    def intra05_test(self):
+        """Verify intra server side COPY succeeds when using NULL as destination
+           offset
+        """
+        self.test_group("Verify intra server side COPY succeeds when using NULL as destination offset")
+        self.basic_ssc(dst_off=None, dst_seek=self.filesize/2)
+
+    def intra06_test(self):
+        """Verify intra server side COPY succeeds when using count = 0"""
+        self.test_group("Verify intra server side COPY succeeds when using count = 0")
+        self.basic_ssc(nbytes=0)
+
+    def intra07_test(self):
+        """Verify intra server side COPY succeeds when the source file is opened
+           as read/write
+        """
+        self.test_group("Verify intra server side COPY succeeds when the source file is opened as read/write")
+        self.basic_ssc(srcopen=os.O_RDWR)
+
+    def intra08_test(self):
+        """Verify intra server side COPY succeeds when the destination file is
+           opened as read/write
+        """
+        self.test_group("Verify intra server side COPY succeeds when the destination file is opened as read/write")
+        self.basic_ssc(dstopen=os.O_RDWR|os.O_CREAT)
+
+    def intra09_test(self):
+        """Verify intra server side COPY fails when the source file is opened
+           as write only
+        """
+        self.test_group("Verify intra server side COPY fails when the source file is opened as write only")
+        self.basic_ssc(srcopen=os.O_WRONLY, failure=errno.EBADF)
+
+    def intra10_test(self):
+        """Verify intra server side COPY fails when the destination file is opened
+           as read only
+        """
+        self.test_group("Verify intra server side COPY fails when the destination file is opened as read only")
+        self.basic_ssc(dstopen=os.O_RDONLY, failure=errno.EBADF, dstfail=1)
+
+    def intra11_test(self):
+        """Verify intra server side COPY fails when source offset is beyond the
+           end of the file
+        """
+        self.test_group("Verify intra server side COPY fails when source offset is beyond the end of the file")
+        msg = "source offset is beyond the end of the file"
+        self.basic_ssc(src_off=self.filesize, failure=errno.EINVAL, copymsg=msg)
+
+    def intra12_test(self):
+        """Verify intra server side COPY fails when source offset plus count
+           is beyond the end of the file
+        """
+        self.test_group("Verify intra server side COPY fails when source offset plus count is beyond the end of the file")
+        msg = "source offset plus count is beyond the end of the file"
+        self.basic_ssc(src_off=self.s_offset, nbytes=self.filesize, copymsg=msg)
+
+    def intra13_test(self):
+        """Verify intra server side COPY fails when both source and destination
+           files point to the same file
+        """
+        self.test_group("Verify intra server side COPY fails when both source and destination files point to the same file")
+        msg = "both source and destination files point to the same file"
+        self.basic_ssc(samefile=1, failure=errno.EINVAL, copymsg=msg)
+
+    def intra14_test(self):
+        """Verify intra server side COPY succeeds when using multiple source and
+           destination offsets
+        """
+        self.test_group("Verify intra server side COPY succeeds when using multiple source and destination offsets")
+        self.basic_ssc(ncopies=self.ncopies, nbytes=self.filesize/self.ncopies, src_doff=1)
+
+    def intra15_test(self):
+        """Verify intra server side COPY succeeds when using multiple source and
+           destination files
+        """
+        self.test_group("Verify intra server side COPY succeeds when using multiple source and destination files")
+        self.basic_ssc(nsfiles=self.src_files, ndfiles=self.dst_files)
+
+    #======================================================================
+    # INTER Server Side Copy
+    #======================================================================
+    def inter01_test(self):
+        """Verify inter server side COPY succeeds"""
+        self.test_group("Verify inter server side COPY succeeds")
+        self.basic_ssc(inter=1)
+
+    def inter02_test(self):
+        """Verify inter server side COPY succeeds when using source offset"""
+        self.test_group("Verify inter server side COPY succeeds when using source offset")
+        self.basic_ssc(src_off=self.s_offset, nbytes=self.s_nbytes, inter=1)
+
+    def inter03_test(self):
+        """Verify inter server side COPY succeeds when using destination offset"""
+        self.test_group("Verify inter server side COPY succeeds when using destination offset")
+        self.basic_ssc(dst_off=self.filesize/2, inter=1)
+
+    def inter04_test(self):
+        """Verify inter server side COPY succeeds when using NULL as source offset"""
+        self.test_group("Verify inter server side COPY succeeds when using NULL as source offset")
+        self.basic_ssc(src_off=None, src_seek=self.s_offset, nbytes=self.s_nbytes, inter=1)
+
+    def inter05_test(self):
+        """Verify inter server side COPY succeeds when using NULL as destination
+           offset
+        """
+        self.test_group("Verify inter server side COPY succeeds when using NULL as destination offset")
+        self.basic_ssc(dst_off=None, dst_seek=self.filesize/2, inter=1)
+
+    def inter06_test(self):
+        """Verify inter server side COPY succeeds when using count = 0"""
+        self.test_group("Verify inter server side COPY succeeds when using count = 0")
+        self.basic_ssc(nbytes=0, inter=1)
+
+    def inter07_test(self):
+        """Verify inter server side COPY succeeds when the source file is opened
+           as read/write
+        """
+        self.test_group("Verify inter server side COPY succeeds when the source file is opened as read/write")
+        self.basic_ssc(srcopen=os.O_RDWR, inter=1)
+
+    def inter08_test(self):
+        """Verify inter server side COPY succeeds when the destination file is
+           opened as read/write
+        """
+        self.test_group("Verify inter server side COPY succeeds when the destination file is opened as read/write")
+        self.basic_ssc(dstopen=os.O_RDWR|os.O_CREAT, inter=1)
+
+    def inter09_test(self):
+        """Verify inter server side COPY fails when the source file is opened
+           as write only
+        """
+        self.test_group("Verify inter server side COPY fails when the source file is opened as write only")
+        self.basic_ssc(srcopen=os.O_WRONLY, failure=errno.EBADF, inter=1)
+
+    def inter10_test(self):
+        """Verify inter server side COPY fails when the destination file is opened
+           as read only
+        """
+        self.test_group("Verify inter server side COPY fails when the destination file is opened as read only")
+        self.basic_ssc(dstopen=os.O_RDONLY, failure=errno.EBADF, dstfail=1, inter=1)
+
+    def inter11_test(self):
+        """Verify inter server side COPY fails when source offset is beyond the
+           end of the file
+        """
+        self.test_group("Verify inter server side COPY fails when source offset is beyond the end of the file")
+        msg = "source offset is beyond the end of the file"
+        self.basic_ssc(src_off=self.filesize, failure=errno.EINVAL, copymsg=msg, inter=1)
+
+    def inter12_test(self):
+        """Verify inter server side COPY fails when source offset plus count
+           is beyond the end of the file
+        """
+        self.test_group("Verify inter server side COPY fails when source offset plus count is beyond the end of the file")
+        msg = "source offset plus count is beyond the end of the file"
+        self.basic_ssc(src_off=self.s_offset, nbytes=self.filesize, copymsg=msg, inter=1)
+
+    def inter13_test(self):
+        """Verify inter server side COPY succeeds when both source and destination
+           file names are the same
+        """
+        self.test_group("Verify inter server side COPY succeeds when both source and destination file names are the same")
+        msg = "both source and destination file names are the same"
+        self.basic_ssc(samefile=1, copymsg=msg, inter=1)
+
+    def inter14_test(self):
+        """Verify inter server side COPY succeeds when using multiple source and
+           destination offsets
+        """
+        self.test_group("Verify inter server side COPY succeeds when using multiple source and destination offsets")
+        self.basic_ssc(ncopies=self.ncopies, nbytes=self.filesize/self.ncopies, src_doff=1, inter=1)
+
+    def inter15_test(self):
+        """Verify inter server side COPY succeeds when using multiple source and
+           destination files
+        """
+        self.test_group("Verify inter server side COPY succeeds when using multiple source and destination files")
+        self.basic_ssc(nsfiles=self.src_files, ndfiles=self.dst_files, inter=1)
+
+################################################################################
+# Entry point
+x = SSCTest(usage=USAGE, testnames=TESTNAMES, testgroups=TESTGROUPS, sid=SCRIPT_ID)
+
+try:
+    x.setup()
+
+    # Run all the tests
+    x.run_tests()
+except Exception:
+    x.test(False, traceback.format_exc())
+finally:
+    x.cleanup()
+    x.exit()

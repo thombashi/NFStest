@@ -75,6 +75,7 @@ that after every test is run the iptables is flushed and reset so any rules
 previously setup will be lost. Currently, there is no mechanism to restore
 the iptables rules to their original state.
 
+
 Tests
 =====
     nfstest_alloc - Space reservation tests
@@ -234,6 +235,31 @@ Tests
     Valid for NFSv4.2 and beyond
 
 
+    nfstest_ssc - Server Side Copy
+    ==============================
+    Verify correct functionality of server side copy
+
+    Copying a file via NFS the client reads the data from the source file and
+    then writes the same data to the destination file which is located in the
+    same server or it could be located in a different server. Either way the
+    file data is transferred twice, once for reading and the second for writing.
+    Server side copy allows unnecessary network traffic to be eliminated.
+    The intra-server copy allows the client to request the server to perform
+    the copy internally thus avoiding any data being sent through the network
+    at all. In the case for the inter-server copy where the destination server
+    is different from the source server, the client authorizes both servers
+    to interact directly with one another.
+
+    Basic server side copy tests verify the actual file range from the source
+    file(s) are copied correctly to the destination file(s). Most tests deal
+    with a single source and destination file while verifying the data is copied
+    correctly. Also it verifies the data is copied starting from the correct
+    source offset and it is copied to the correct offset on the destination file.
+    Other tests deal with multiple files: copying multiple source files to a
+    single destination file, a single source file to multiple destination files,
+    or N number of source files to M number of destination files.
+
+
 Tools
 =====
     nfstest_io - I/O tool
@@ -373,6 +399,12 @@ Run the tests
 
    The only required option is --server
    $ nfstest_sparse --server 192.168.0.11
+
+   The only required option is --server (run all intra-server side copy tests)
+   $ nfstest_ssc --server 192.168.0.11
+
+   Run all tests (intra & inter)
+   $ nfstest_ssc --server 192.168.0.11 --dst-server 192.168.0.12
 
    The only required option is --datadir (-d)
    $ nfstest_io -d /mnt/t/data -v all -n 10 -r 3600

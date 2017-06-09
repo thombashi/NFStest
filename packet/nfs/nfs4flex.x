@@ -36,7 +36,7 @@
  *   IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  *   ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * This code was derived from [draft-ietf-nfsv4-flex-files-06].
+ * This code was derived from [draft-ietf-nfsv4-flex-files-08].
  */
 
 /* STRFMT1: vers:{0}.{1} */
@@ -55,7 +55,9 @@ struct ff_device_addr4 {
     ff_device_versions4  versions<>;
 };
 
-const FF_FLAGS_NO_LAYOUTCOMMIT   = 1;
+const FF_FLAGS_NO_LAYOUTCOMMIT   = 0x00000001;
+const FF_FLAGS_NO_IO_THRU_MDS    = 0x00000002;
+const FF_FLAGS_NO_READ_IO        = 0x00000004;
 typedef uint32_t  ff_flags4;
 
 /* STRFMT1: {3:crc32} */
@@ -79,6 +81,7 @@ struct ff_layout4 {
     length4     stripe_unit;
     ff_mirror4  mirrors<>;
     ff_flags4   flags;
+    uint32_t    stats_hint;
 };
 
 struct ff_ioerr4 {

@@ -30,7 +30,7 @@ from nfstest.test_util import TestUtil
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.1"
+__version__   = "1.2"
 
 USAGE = """%prog --server <server> [options]
 
@@ -244,6 +244,11 @@ class PosixTest(TestUtil):
         self.scan_options()
 
         # Function prototypes for system calls in libc
+        self.libc.opendir.restype  = ctypes.c_void_p
+        self.libc.closedir.argtypes= ctypes.c_void_p,
+        self.libc.rewinddir.argtypes = ctypes.c_void_p,
+        self.libc.readdir.argtypes = ctypes.c_void_p,
+        self.libc.readdir.restype  = ctypes.POINTER(DirEnt)
         self.libc.telldir.argtypes = ctypes.c_void_p,
         self.libc.telldir.restype  = ctypes.c_long
         self.libc.seekdir.argtypes = ctypes.c_void_p, ctypes.c_long
@@ -397,8 +402,7 @@ class PosixTest(TestUtil):
         self.test(e != None and e.errno == 9, "close - read after close should return an error")
 
     def closedir_test(self):
-        """Verify POSIX API closedir() works and that reading to a closed file
-           descriptor returns an error.
+        """Verify POSIX API closedir() works
         """
         self.test_group("Verify POSIX API closedir() on %s" % self.nfsstr())
 
@@ -407,9 +411,6 @@ class PosixTest(TestUtil):
         fd = self.libc.opendir(self.absdir)
         out = self.libc.closedir(fd)
         self.test(out == 0, "closedir - closedir() should succeed")
-
-        dirent = self.libc.readdir(fd)
-        self.test(dirent == 0, "closedir - readdir after closedir should return an error")
 
     def creat_test(self):
         """Verify POSIX API creat(path, mode) is equivalent to
@@ -438,13 +439,15 @@ class PosixTest(TestUtil):
         self.test(fstat.st_mode & 0777 == mode, "creat - mode permissions of opened file should not be changed")
         self.test(fstat.st_size == 0, "creat - existent file should be truncated")
 
-    def _do_io(self, fd, dmsg):
+    def _do_io(self, fd, dmsg, pattern=None):
         """Wrapper to do I/O."""
         self.dprint('DBG3', dmsg)
         if self.posix_read:
-            self.posix_data += posix.read(fd, self.posix_iosize)
+            return posix.read(fd, self.posix_iosize)
         else:
-            self.posix_offset += posix.write(fd, self.data_pattern(self.posix_offset, self.posix_iosize))
+            count = posix.write(fd, self.data_pattern(self.posix_offset, self.posix_iosize, pattern=pattern))
+            self.posix_offset += count
+            return count
 
     def _fcntl_test(self, objtype):
         """Verify the POSIX API fcntl() commands F_DUPFD, F_GETFD, F_SETFD,
@@ -472,20 +475,37 @@ class PosixTest(TestUtil):
             self.posix_read = False
             self.get_filename()
 
+        self.test_info("fcntl on %s file descriptor" % objtype)
         self.dprint('DBG3', "Open file %s for %s" % (self.absfile, str_ing))
         fd = posix.open(self.absfile, mode)
         self.posix_offset = 0
-        self.posix_data = ''
-        self.posix_iosize = 32
+        self.posix_iosize = 64
         test_pos = 32
         nfd = 1000
 
-        self._do_io(fd, "%s file" % objtype.capitalize())
+        for i in xrange(10):
+            self._do_io(fd, "%s file" % objtype.capitalize())
 
         self.dprint('DBG3', "DUP file descriptor using POSIX API fcntl(fd, F_DUPFD, n)")
         self.libc.fcntl.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
         fd2 = self.libc.fcntl(fd, fcntl.F_DUPFD, nfd)
         self.test(fd2 >= nfd, "fcntl - DUP'ed file descriptor should be greater than or equal to the value given")
+
+        self.dprint('DBG3', "Reposition file pointer using DUP'ed file descriptor")
+        posix.lseek(fd2, test_pos, os.SEEK_SET)
+        pos = posix.lseek(fd, 0, os.SEEK_CUR)
+        self.test(pos == test_pos, "fcntl - repositioning file pointer using DUP'ed file descriptor should reposition it in the original file descriptor as well")
+        self.posix_offset = pos
+        out = self._do_io(fd, "%s file using original file descriptor" % objtype.capitalize(), pattern="-")
+        if self.posix_read:
+            data = self.data_pattern(test_pos, self.posix_iosize)
+        else:
+            data = self.data_pattern(test_pos, self.posix_iosize, pattern="-")
+            fdr = open(self.absfile, "r")
+            fdr.seek(test_pos)
+            out = fdr.read(self.posix_iosize)
+            fdr.close()
+        self.test(out == data, "fcntl - %s data is correct when repositioning file pointer using DUP'ed file descriptor" % str_ed)
 
         fdflags = self.libc.fcntl(fd, fcntl.F_GETFD, 0)
         self.test(fdflags >= 0, "fcntl - F_GETFD should succeed")
@@ -493,6 +513,8 @@ class PosixTest(TestUtil):
         self.test(out != -1, "fcntl - F_SETFD should succeed")
         fdflags = self.libc.fcntl(fd, fcntl.F_GETFD, 0)
         self.test(fdflags & fcntl.FD_CLOEXEC == fcntl.FD_CLOEXEC, "fcntl - F_SETFD should set the given file descriptor flag correctly")
+        fdflags = self.libc.fcntl(fd2, fcntl.F_GETFD, 0)
+        self.test(fdflags & fcntl.FD_CLOEXEC != fcntl.FD_CLOEXEC, "fcnlt - F_SETFD should change the flag for the given file descriptor only")
 
         flflags = self.libc.fcntl(fd, fcntl.F_GETFL, 0)
         self.test(flflags >= 0, "fcntl - F_GETFL should succeed")
@@ -500,33 +522,24 @@ class PosixTest(TestUtil):
         self.test(out != -1, "fcntl - F_SETFL should succeed")
         flflags = self.libc.fcntl(fd, fcntl.F_GETFL, 0)
         self.test(flflags & os.O_APPEND == os.O_APPEND, "fcntl - F_SETFL should set the given file status flag correctly")
+        flflags = self.libc.fcntl(fd2, fcntl.F_GETFL, 0)
+        self.test(flflags & os.O_APPEND == os.O_APPEND, "fcnlt - F_SETFL should change the flag for all file descriptors on the same file")
 
-        flags = self.libc.fcntl(fd2, fcntl.F_GETFD, 0)
-        self.test(flags != fdflags, "fcnlt - F_SETFD should change the flag for the given file descriptor only")
-        flags = self.libc.fcntl(fd2, fcntl.F_GETFL, 0)
-        self.test(flags == flflags, "fcnlt - F_SETFL should change the flag for all file descriptors on the same file")
+        if not self.posix_read:
+            self.dprint('DBG3', "Reposition file pointer using DUP'ed file descriptor")
+            posix.lseek(fd2, test_pos, os.SEEK_SET)
+            pos = posix.lseek(fd, 0, os.SEEK_CUR)
+            self.test(pos == test_pos, "fcntl - repositioning file pointer using DUP'ed file descriptor should reposition it in the original file descriptor as well")
+            self.posix_offset = pos
+            out = self._do_io(fd2, "%s file using DUP'ed file descriptor" % objtype.capitalize(), pattern="+")
 
-        for i in xrange(10):
-            self._do_io(fd2, "%s file using DUP'ed file descriptor" % objtype.capitalize())
-
-        self._do_io(fd, "%s file using original file descriptor" % objtype.capitalize())
-
-        if objtype == 'read':
-            test_expr = self.posix_data == self.data_pattern(0, len(self.posix_data))
-        else:
+            data = self.data_pattern(test_pos, self.posix_iosize, pattern="+")
             fdr = open(self.absfile, "r")
-            data = fdr.read()
+            fdr.seek(-self.posix_iosize, os.SEEK_END)
+            out = fdr.read(self.posix_iosize)
             fdr.close()
-            test_expr = data == self.data_pattern(0, self.posix_offset)
-        self.test(test_expr, "fcntl - %s data on both file descriptors should be correct" % str_ed)
+            self.test(out == data, "fcntl - data is %s correctly at the end of the file when O_APPEND is set regardless where the file pointer is set" % str_ed)
 
-        self.dprint('DBG3', "Reposition file pointer using DUP'ed file descriptor")
-        posix.lseek(fd2, test_pos, os.SEEK_SET)
-        pos = posix.lseek(fd, 0, os.SEEK_CUR)
-        self.posix_offset = pos
-        self.posix_data = ""
-        self._do_io(fd, "%s file using original file descriptor" % objtype.capitalize())
-        self.test(pos == test_pos, "fcntl - repositioning file pointer using DUP'ed file descriptor should reposition it in the original file descriptor as well")
         posix.close(fd)
 
         try:
@@ -540,11 +553,13 @@ class PosixTest(TestUtil):
         out = self.libc.fcntl(fd2, fcntl.F_SETLKW, ctypes.byref(flock))
         self.test(out != -1, "fcntl - F_SETLKW (%s) should succeed" % str_lck)
 
-        pos = posix.lseek(fd2, 0, os.SEEK_CUR)
+        pos = posix.lseek(fd2, 0, os.SEEK_SET)
         self.posix_offset = pos
-        self.posix_data = ""
-        self._do_io(fd2, "%s file using DUP'ed file descriptor" % objtype.capitalize())
-        test_expr = self.posix_data == self.data_pattern(pos, len(self.posix_data))
+        out = self._do_io(fd2, "%s file using DUP'ed file descriptor" % objtype.capitalize())
+        if self.posix_read:
+            test_expr = out == self.data_pattern(0, self.posix_iosize)
+        else:
+            test_expr = out == self.posix_iosize
         self.test(test_expr, "fcntl - %s on DUP'ed descriptor after closing original file descriptor should succeed" % objtype)
 
         flock = Flock(fcntl.F_UNLCK, 0, 0, int(self.filesize/4), 0)
@@ -779,7 +794,8 @@ class PosixTest(TestUtil):
             fstat = posix.fstat(fd)
             posix.close(fd)
 
-        self.test(fstat.st_mode & 0777 == mode, "%s - %s permissions should be correct" % (op_str, type), failmsg=", expecting %05o and got %05o" % (mode, fstat.st_mode & 0777))
+        if type != "symbolic link":
+            self.test(fstat.st_mode & 0777 == mode, "%s - %s permissions should be correct" % (op_str, type), failmsg=", expecting %05o and got %05o" % (mode, fstat.st_mode & 0777))
         self.test(is_func(fstat.st_mode), "%s - object type should be a %s%s" % (op_str, reg, type))
         self.test(fstat.st_nlink == nlink, "%s - %s st_nlink should be equal to %d" % (op_str, type, nlink), failmsg=", expecting %d and got %d" % (nlink, fstat.st_nlink))
         self.test(fstat.st_uid == os.getuid(), "%s - %s st_uid should be correct" % (op_str, type), failmsg=", expecting %d and got %d" % (os.getuid(), fstat.st_uid))
@@ -1090,6 +1106,7 @@ class PosixTest(TestUtil):
                         pass
                     strerror = ": %s" % openerr.strerror if openerr else ""
 
+                    fstat = None
                     if opened:
                         # Get file stats after open
                         fstat = posix.fstat(fd)
@@ -1139,11 +1156,15 @@ class PosixTest(TestUtil):
                         elif posix.O_CREAT in flags:
                             # O_CREAT is set
                             msg = "open - file should be created when O_CREAT is used"
-                            self.test(os.path.exists(self.absfile), msg, subtest=flag_str)
-                            expr = fstat.st_mode & 0777 == perms
-                            msg = "open - file should be created with correct permission mode"
-                            fmsg = ": expecting %04o, got %04o" % (perms, fstat.st_mode & 0777)
-                            self.test(expr, msg, subtest=flag_str, failmsg=fmsg)
+                            file_exists = os.path.exists(self.absfile)
+                            self.test(file_exists, msg, subtest=flag_str)
+                            if file_exists:
+                                if fstat is None:
+                                    fstat = os.stat(self.absfile)
+                                expr = fstat.st_mode & 0777 == perms
+                                msg = "open - file should be created with correct permission mode"
+                                fmsg = ": expecting %04o, got %04o" % (perms, fstat.st_mode & 0777)
+                                self.test(expr, msg, subtest=flag_str, failmsg=fmsg)
                         else:
                             # O_CREAT is not set
                             (expr, fmsg) = self._oserror(openerr, errno.ENOENT)
@@ -1235,9 +1256,9 @@ class PosixTest(TestUtil):
         self.create_dir()
         fd = self.libc.opendir(self.absdir)
         self.libc.closedir(fd)
-        self.test(fd > 0, "opendir - opendir() on an existent directory should succeed")
+        self.test(fd != None, "opendir - opendir() on an existent directory should succeed")
         fd = self.libc.opendir(self.absdir+'bogus')
-        self.test(fd == 0, "opendir - opendir() on a non-existent directory should fail")
+        self.test(fd == None, "opendir - opendir() on a non-existent directory should fail")
 
     def read_test(self):
         """Verify POSIX API read() by reading data from a file. Verify that
@@ -1245,10 +1266,8 @@ class PosixTest(TestUtil):
            of 0 bytes returns 0.
         """
         self.test_group("Verify POSIX API read() on %s" % self.nfsstr())
-        #self.umount()
-        #self.mount()
 
-        absfile = self.abspath(self.files[0])
+        absfile = self.abspath(self.files[1])
         self.dprint('DBG3', "Open file %s for reading" % absfile)
         fd = posix.open(absfile, posix.O_RDONLY)
         fstat_b = os.stat(absfile)
@@ -1274,10 +1293,9 @@ class PosixTest(TestUtil):
         fd = self.libc.opendir(self.absdir)
         dirlist = []
         while True:
-            c_dirent = self.libc.readdir(fd)
-            if c_dirent == 0:
+            dirent = self.libc.readdir(fd)
+            if not bool(dirent):
                 break
-            dirent = ctypes.cast(c_dirent, ctypes.POINTER(DirEnt))
             dirlist.append(dirent[0].d_name)
         self.libc.closedir(fd)
 
@@ -1430,7 +1448,6 @@ class PosixTest(TestUtil):
         rlink = os.readlink(self.absfile)
         self.test(lstat != None, "symlink - symbolic link should be created")
         self.test(stat.S_ISLNK(lstat.st_mode), "symlink - object type should be a symbolic link")
-        self.test(lstat.st_mode & 0777 == 0777, "symlink - symbolic link should be created with correct mode 0777")
         self.test(rlink == srcfile, "symlink - symbolic link data should be the name of the source file")
 
     def _sync(self, objtype):
@@ -1504,17 +1521,15 @@ class PosixTest(TestUtil):
         while True:
             offset = self.libc.telldir(fd)
             offsets.append(offset)
-            c_dirent = self.libc.readdir(fd)
-            if c_dirent == 0:
+            dirent = self.libc.readdir(fd)
+            if not bool(dirent):
                 break
-            dirent = ctypes.cast(c_dirent, ctypes.POINTER(DirEnt))
             dirlist.append(dirent[0].d_name)
 
         if objtype == 'rewinddir':
             self.libc.rewinddir(fd)
             self.test(True, "%s - directory rewind should succeed after reaching end of list" % objtype)
-            c_dirent = self.libc.readdir(fd)
-            dirent = ctypes.cast(c_dirent, ctypes.POINTER(DirEnt))
+            dirent = self.libc.readdir(fd)
             self.test(dirent[0].d_name == dirlist[0], "%s - directory entry is correct after rewind" % objtype)
             index = int(N/2)
             name = self._readdir(fd, index)

@@ -14,7 +14,7 @@
 import os
 
 NFSTEST_PACKAGE          = 'NFStest'
-NFSTEST_VERSION          = '2.1.1'
+NFSTEST_VERSION          = '2.1.5'
 NFSTEST_SUMMARY          = 'NFS Test Suite'
 NFSTEST_AUTHOR           = 'Jorge Mora'
 NFSTEST_AUTHOR_EMAIL     = 'mora@netapp.com'
@@ -115,6 +115,7 @@ NFSTEST_SCRIPTS = [
     'test/nfstest_pnfs',
     'test/nfstest_posix',
     'test/nfstest_sparse',
+    'test/nfstest_ssc',
     'test/nfstest_xid',
 ]
 NFSTEST_ALLMODS = [
@@ -126,16 +127,24 @@ NFSTEST_ALLMODS = [
     'nfstest/rexec.py',
     'nfstest/test_util.py',
     'nfstest/utils.py',
+    'packet/derunpack.py',
     'packet/pkt.py',
     'packet/pktt.py',
     'packet/record.py',
     'packet/unpack.py',
     'packet/utils.py',
+    'packet/application/dns.py',
+    'packet/application/dns_const.py',
     'packet/application/gss.py',
     'packet/application/gss_const.py',
+    'packet/application/krb5.py',
+    'packet/application/krb5_const.py',
+    'packet/application/ntp4.py',
     'packet/application/rpc.py',
     'packet/application/rpc_const.py',
     'packet/application/rpc_creds.py',
+    'packet/internet/arp.py',
+    'packet/internet/arp_const.py',
     'packet/internet/ipv4.py',
     'packet/internet/ipv6.py',
     'packet/internet/ipv6addr.py',

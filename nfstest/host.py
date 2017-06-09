@@ -29,12 +29,13 @@ import socket
 import subprocess
 import nfstest_config as c
 from baseobj import BaseObj
+from packet.pktt import Pktt
 
 # Module constants
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.2"
+__version__   = "1.3"
 
 class Host(BaseObj):
     """Host object
@@ -67,6 +68,21 @@ class Host(BaseObj):
 
            # Unmount volume
            x.umount()
+
+           # Start packet trace
+           x.trace_start()
+
+           # Stop packet trace
+           x.trace_stop()
+
+           # Open packet trace
+           x.trace_open()
+
+           # Enable NFS kernel debug
+           x.nfs_debug_enable(nfsdebug='all'):
+
+           # Stop NFS kernel debug
+           x.nfs_debug_reset()
     """
     def __init__(self, **kwargs):
         """Constructor
@@ -99,6 +115,27 @@ class Host(BaseObj):
                Network device interface [default: 'eth0']
            nomount:
                Debug option so the server is not actually mounted [default: False]
+           tracename:
+               Base name for trace files to create [default: 'tracefile']
+           trcdelay:
+               Seconds to delay before stopping packet trace [default: 0.0]
+           tcpdump:
+               Tcpdump command [default: '/usr/sbin/tcpdump']
+           tbsize:
+               Capture buffer size in kB [default: 150000]
+           notrace:
+               Debug option so a trace is not actually started [default: False]
+           rpcdebug:
+               Set RPC kernel debug flags and save log messages [default: '']
+           nfsdebug:
+               Set NFS kernel debug flags and save log messages [default: '']
+           dbgname:
+               Base name for log messages files to create [default: 'dbgfile']
+           messages:
+               Location of file for system messages [default: '/var/log/messages']
+           tmpdir:
+               Temporary directory where trace/debug files are created
+               [default: '/tmp']
            iptables:
                Iptables command [default: '/usr/sbin/iptables']
            sudo:
@@ -118,11 +155,29 @@ class Host(BaseObj):
         self.mtopts       = kwargs.pop("mtopts",       c.NFSTEST_MTOPTS)
         self.interface    = kwargs.pop("interface",    c.NFSTEST_INTERFACE)
         self.nomount      = kwargs.pop("nomount",      False)
+        self.tracename    = kwargs.pop("tracename",    'tracefile')
+        self.trcdelay     = kwargs.pop("trcdelay",     0.0)
+        self.tcpdump      = kwargs.pop("tcpdump",      c.NFSTEST_TCPDUMP)
+        self.tbsize       = kwargs.pop("tbsize",       150000)
+        self.notrace      = kwargs.pop("notrace",      False)
+        self.rpcdebug     = kwargs.pop("rpcdebug",     '')
+        self.nfsdebug     = kwargs.pop("nfsdebug",     '')
+        self.dbgname      = kwargs.pop("dbgname",      'dbgfile')
+        self.messages     = kwargs.pop("messages",     c.NFSTEST_MESSAGESLOG)
+        self.tmpdir       = kwargs.pop("tmpdir",       c.NFSTEST_TMPDIR)
         self.iptables     = kwargs.pop("iptables",     c.NFSTEST_IPTABLES)
         self.sudo         = kwargs.pop("sudo",         c.NFSTEST_SUDO)
+
         # Initialize object variables
         self.mtdir = self.mtpoint
         self.mounted = False
+        self._nfsdebug = False
+        self.dbgidx = 1
+        self.dbgfile = ''
+        self.traceidx = 1
+        self.tracefile = ''
+        self.tracefiles = []
+        self.traceproc = None
         self.process_list = []
         self.process_smap = {}
         self.process_dmap = {}
@@ -148,6 +203,7 @@ class Host(BaseObj):
 
            Gracefully unmount volume and reset network.
         """
+        self.trace_stop()
         if self.need_network_reset:
             self.network_reset()
         if self.mounted:
@@ -183,6 +239,12 @@ class Host(BaseObj):
         else:
             return "NFSv%d.%d" % (nver, mver)
 
+    def abspath(self, filename, dir=None):
+        """Return the absolute path for the given file name."""
+        bdir = "" if dir is None else "%s/" % dir
+        path = "%s/%s%s" % (self.mtdir, bdir, filename)
+        return path
+
     def sudo_cmd(self, cmd):
         """Prefix the SUDO command if effective user is not root."""
         if os.getuid() != 0:
@@ -217,9 +279,9 @@ class Host(BaseObj):
            exit status is stored in the object attribute 'self.returncode'.
         """
         self.process = None
-        self.pstdout = '' 
-        self.pstderr = '' 
-        self.perror  = '' 
+        self.pstdout = ''
+        self.pstderr = ''
+        self.perror  = ''
         self.returncode = 0
         if self.user is not None and len(self.user) > 0:
             user = self.user + '@'
@@ -463,17 +525,169 @@ class Host(BaseObj):
         # Try to umount 5 times
         cmd = "umount -f %s" % self.mtpoint
         for i in range(5):
-            time.sleep(1)
             try:
                 self.run_cmd(cmd, sudo=True, dlevel='DBG2', msg="Unmount volume: ")
             except:
                 pass
 
-            if self.returncode == 0 or re.search('not (mounted|found)', self.perror):
+            if self.returncode == 0 or re.search('not (mounted|found)|Invalid argument', self.perror):
                 # Unmount succeeded or directory not mounted
                 self.mounted = False
                 break
             self.dprint('DBG2', self.perror)
+            time.sleep(1)
+
+    def trace_start(self, tracefile=None, interface=None, capsize=None, clients=None):
+        """Start trace on interface given
+
+           tracefile:
+               Name of trace file to create, default is a unique name
+               created in the temporary directory using self.tracename as the
+               base name.
+           capsize:
+               Use the -C option of tcpdump to split the trace files every
+               1000000*capsize bytes. See documentation for tcpdump for more
+               information
+           clients:
+               List of Host() objects to monitor
+
+           Return the name of the trace file created.
+        """
+        self.trace_stop()
+        if tracefile:
+            self.tracefile = tracefile
+        else:
+            self.tracefile = "%s/%s_%d.cap" % (self.tmpdir, self.tracename, self.traceidx)
+            self.traceidx += 1
+        if not self.notrace:
+            if len(self.nfsdebug) or len(self.rpcdebug):
+                self.nfs_debug_enable()
+            self.tracefiles.append(self.tracefile)
+
+            if clients is None:
+                clients = self.clients
+
+            if interface is None:
+                interface = self.interface
+
+            opts = ""
+            if interface is not None:
+                opts += " -i %s" % interface
+
+            if capsize:
+                opts += " -C %d" % capsize
+
+            hosts = self.ipaddr
+            for cobj in clients:
+                hosts += " or %s" % cobj.ipaddr
+
+            cmd = "%s%s -n -B %d -s 0 -w %s host %s" % (self.tcpdump, opts, self.tbsize, self.tracefile, hosts)
+            self.run_cmd(cmd, sudo=True, dlevel='DBG2', msg="Trace start: ", wait=False)
+            self.traceproc = self.process
+
+            # Make sure tcpdump has started
+            out = self.traceproc.stderr.readline()
+            if not re.search('listening on', out):
+                time.sleep(1)
+                if self.process.poll() is not None:
+                    raise Exception(out)
+        return self.tracefile
+
+    def trace_stop(self):
+        """Stop the trace started by trace_start()."""
+        try:
+            if self.traceproc:
+                self.dprint('DBG2', "Trace stop")
+                time.sleep(self.trcdelay)
+                self.run_cmd("killall tcpdump", sudo=True, dlevel='DBG2')
+                self.stop_cmd(self.traceproc)
+                self.traceproc = None
+            if not self.notrace and self._nfsdebug:
+                self.nfs_debug_reset()
+        except:
+            return
+
+    def trace_open(self, tracefile=None, **kwargs):
+        """Open the trace file given or the trace file started by trace_start().
+
+           All extra options are passed directly to the packet trace object.
+
+           Return the packet trace object created, the packet trace object
+           is also stored in the object attribute pktt.
+        """
+        if tracefile is None:
+            tracefile = self.tracefile
+        self.dprint('DBG1', "trace_open [%s]" % tracefile)
+        self.pktt = Pktt(tracefile, **kwargs)
+        return self.pktt
+
+    def nfs_debug_enable(self, **kwargs):
+        """Enable NFS debug messages.
+
+           rpcdebug:
+               Set RPC kernel debug flags and save log messages [default: self.rpcdebug]
+           nfsdebug:
+               Set NFS kernel debug flags and save log messages [default: self.nfsdebug]
+           dbgfile:
+               Name of log messages file to create, default is a unique name
+               created in the temporary directory using self.dbgname as the
+               base name.
+        """
+        modmsgs = {
+            'nfs': kwargs.pop('nfsdebug', self.nfsdebug),
+            'rpc': kwargs.pop('rpcdebug', self.rpcdebug),
+        }
+        dbgfile = kwargs.pop('dbgfile', None)
+        if dbgfile is not None:
+            self.dbgfile = dbgfile
+        else:
+            self.dbgfile = "%s/%s_%d.msg" % (self.tmpdir, self.dbgname, self.dbgidx)
+            self.dbgidx += 1
+
+        if modmsgs['nfs'] is None and modmsgs['rpc'] is None:
+            return
+
+        if os.path.exists(self.messages):
+            fstat = os.stat(self.messages)
+            self.dbgoffset = fstat.st_size
+            self.dbgmode = fstat.st_mode & 0777
+            for mod in modmsgs.keys():
+                if len(modmsgs[mod]):
+                    self._nfsdebug = True
+                    cmd = "rpcdebug -v -m %s -s %s" % (mod, modmsgs[mod])
+                    self.run_cmd(cmd, sudo=True, dlevel='DBG2', msg="NFS debug enable: ")
+
+    def nfs_debug_reset(self):
+        """Reset NFS debug messages."""
+        for mod in ('nfs', 'rpc'):
+            try:
+                cmd = "rpcdebug -v -m %s -c" % mod
+                self.run_cmd(cmd, sudo=True, dlevel='DBG2', msg="NFS debug reset: ")
+            except:
+                pass
+
+        if self.dbgoffset != None:
+            try:
+                fd = None
+                fdw = None
+                os.system(self.sudo_cmd("chmod %o %s" % (self.dbgmode|0444, self.messages)))
+                self.dprint('DBG2', "Creating log messages file [%s]" % self.dbgfile)
+                fdw = open(self.dbgfile, "w")
+                fd = open(self.messages, "r")
+                fd.seek(self.dbgoffset)
+                while True:
+                    data = fd.read(self.rsize)
+                    if len(data) == 0:
+                        break
+                    fdw.write(data)
+            except Exception as e:
+                raise
+            finally:
+                if fd:
+                    fd.close()
+                if fdw:
+                    fdw.close()
+                os.system(self.sudo_cmd("chmod %o %s" % (self.dbgmode, self.messages)))
 
     def network_drop(self, ipaddr, port):
         """Simulate a network drop by dropping all tcp packets going to the
@@ -518,19 +732,24 @@ class Host(BaseObj):
         """Get IP address associated with the given host name.
            This could be run as an instance or class method.
         """
-        lstr = ""
-        ipstr = "v6" if ipv6 else "v4"
-        family = socket.AF_INET6 if ipv6 else socket.AF_INET
-        if len(host) == 0:
-            lstr = "local "
-            host = socket.gethostname()
-
-        try:
-            infolist = socket.getaddrinfo(host, 2049, 0, 0, socket.SOL_TCP)
-        except Exception as e:
-            infolist = []
-        for info in infolist:
-            # Ignore loopback addresses
-            if info[0] == family and info[4][0] not in ('127.0.0.1', '::1'):
-                return info[4][0]
-        raise Exception("Unable to get IP%s address for %shost '%s'" % (ipstr, lstr, host))
+        if len(host) != 0:
+            ipstr = "v6" if ipv6 else "v4"
+            family = socket.AF_INET6 if ipv6 else socket.AF_INET
+            try:
+                infolist = socket.getaddrinfo(host, 2049, 0, 0, socket.SOL_TCP)
+            except Exception:
+                infolist = []
+            for info in infolist:
+                # Ignore loopback addresses
+                if info[0] == family and info[4][0] not in ('127.0.0.1', '::1'):
+                    return info[4][0]
+            raise Exception("Unable to get IP%s address for host '%s'" % (ipstr, host))
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if ipv6:
+                s.connect(("2001:4860:4860::8888", 53))
+            else:
+                s.connect(("8.8.8.8", 53))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip

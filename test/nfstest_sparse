@@ -134,15 +134,13 @@ class SparseTest(TestUtil):
         self.create_file(**uargs)
         self.umount()
 
-    def test_seek(self, fd, whence, tname, msg=""):
+    def test_seek(self, fd, whence, msg=""):
         """Verify SEEK succeeds searching for the next data or hole
 
            fd:
                File descriptor for opened file
            whence:
                Search for data when using SEEK_DATA or a hole using SEEK_HOLE
-           tname:
-               Test name
            msg:
                String to identify the specific test running and it is appended
                to the main assertion message [default: ""]
@@ -170,7 +168,7 @@ class SparseTest(TestUtil):
         offset = 0
         for doffset in offset_list:
             try:
-                self.test_info("====  %s test %02d %s%s" % (tname, self.testidx, SEEKmap[whence], msg))
+                self.test_info("====  %s test %02d %s%s" % (self.testname, self.testidx, SEEKmap[whence], msg))
                 self.testidx += 1
                 self.trace_start()
                 fmsg = ""
@@ -212,7 +210,7 @@ class SparseTest(TestUtil):
                 offset = file_size - 1
 
             self.trace_open()
-            (pktcall, pktreply) = self.find_nfs_op(OP_SEEK, self.server_ipaddr, self.port, status=None)
+            (pktcall, pktreply) = self.find_nfs_op(OP_SEEK, status=None)
             self.dprint('DBG7', str(pktcall))
             self.dprint('DBG7', str(pktreply))
             self.test(pktcall, "SEEK should be sent to the server")
@@ -237,13 +235,11 @@ class SparseTest(TestUtil):
                     fmsg = ", but got %s" % rseekobj.eof
                     self.test(rseekobj.eof == eof, "SEEK should return eof as %s" % nfs_bool[eof], failmsg=fmsg)
 
-    def seek01(self, whence, tname, lock=False):
+    def seek01(self, whence, lock=False):
         """Verify SEEK succeeds searching for the next data or hole
 
            whence:
                Search for data when using SEEK_DATA or a hole using SEEK_HOLE
-           tname:
-               Test name
            lock:
                Lock file before seeking for the data or hole [default: False]
         """
@@ -279,7 +275,7 @@ class SparseTest(TestUtil):
                     self._deleg_granted = True
 
                 # Search for the data/hole segments
-                self.test_seek(fd, whence, tname, msg)
+                self.test_seek(fd, whence, msg)
             except Exception:
                 self.test(False, traceback.format_exc())
             finally:
@@ -292,32 +288,30 @@ class SparseTest(TestUtil):
         self.test_group("Verify SEEK succeeds searching for the next data")
         self.testidx = 1
         self._deleg_granted = False
-        self.seek01(SEEK_DATA, "seek01")
+        self.seek01(SEEK_DATA)
 
         if not self._deleg_granted:
             # Run tests with byte range locking
-            self.seek01(SEEK_DATA, "seek01", lock=True)
+            self.seek01(SEEK_DATA, lock=True)
 
     def seek02_test(self):
         """Verify SEEK succeeds searching for the next hole"""
         self.test_group("Verify SEEK succeeds searching for the next hole")
         self.testidx = 1
         self._deleg_granted = False
-        self.seek01(SEEK_HOLE, "seek02")
+        self.seek01(SEEK_HOLE)
 
         if not self._deleg_granted:
             # Run tests with byte range locking
-            self.seek01(SEEK_HOLE, "seek02", lock=True)
+            self.seek01(SEEK_HOLE, lock=True)
 
-    def seek03(self, whence, offset, tname, sparseidx=0, lock=False, msg=""):
+    def seek03(self, whence, offset, sparseidx=0, lock=False, msg=""):
         """Verify SEEK fails with ENXIO when offset is beyond the end of the file
 
            whence:
                Search for data when using SEEK_DATA or a hole using SEEK_HOLE
            offset:
                Search for data or hole starting from this offset
-           tname:
-               Test name
            sparseidx:
                Index of the sparse file to use for the testing [default: 0]
            lock:
@@ -328,7 +322,7 @@ class SparseTest(TestUtil):
         """
         try:
             fd = None
-            self.test_info("====  %s test %02d %s%s" % (tname, self.testidx, SEEKmap[whence], msg))
+            self.test_info("====  %s test %02d %s%s" % (self.testname, self.testidx, SEEKmap[whence], msg))
             self.testidx += 1
 
             self.umount()
@@ -385,7 +379,7 @@ class SparseTest(TestUtil):
         try:
             self.trace_open()
             self.get_stateid(sfile.filename)
-            (pktcall, pktreply) = self.find_nfs_op(OP_SEEK, self.server_ipaddr, self.port, status=None)
+            (pktcall, pktreply) = self.find_nfs_op(OP_SEEK, status=None)
             self.dprint('DBG7', str(pktcall))
             self.dprint('DBG7', str(pktreply))
             if pktcall:
@@ -414,29 +408,29 @@ class SparseTest(TestUtil):
         """Verify SEEK searching for next data fails with ENXIO when offset is beyond the end of the file"""
         self.test_group("Verify SEEK searching for next data fails with ENXIO when offset is beyond the end of the file")
         self.testidx = 1
-        self.seek03(SEEK_DATA,   self.sparsesize-2, "seek03", 1)
-        self.seek03(SEEK_DATA,   self.sparsesize,   "seek03", 1)
-        self.seek03(SEEK_DATA, 2*self.sparsesize,   "seek03", 1)
+        self.seek03(SEEK_DATA,   self.sparsesize-2, 1)
+        self.seek03(SEEK_DATA,   self.sparsesize,   1)
+        self.seek03(SEEK_DATA, 2*self.sparsesize,   1)
 
         if self.deleg_stateid is None:
             # Run tests with byte range locking
             msg = " (locking file)"
-            self.seek03(SEEK_DATA,   self.sparsesize-2, "seek03", 1, lock=True, msg=msg)
-            self.seek03(SEEK_DATA,   self.sparsesize,   "seek03", 1, lock=True, msg=msg)
-            self.seek03(SEEK_DATA, 2*self.sparsesize,   "seek03", 1, lock=True, msg=msg)
+            self.seek03(SEEK_DATA,   self.sparsesize-2, 1, lock=True, msg=msg)
+            self.seek03(SEEK_DATA,   self.sparsesize,   1, lock=True, msg=msg)
+            self.seek03(SEEK_DATA, 2*self.sparsesize,   1, lock=True, msg=msg)
 
     def seek04_test(self):
         """Verify SEEK searching for next hole fails with ENXIO when offset is beyond the end of the file"""
         self.test_group("Verify SEEK searching for next hole fails with ENXIO when offset is beyond the end of the file")
         self.testidx = 1
-        self.seek03(SEEK_HOLE,   self.sparsesize, "seek04", 1)
-        self.seek03(SEEK_HOLE, 2*self.sparsesize, "seek04", 1)
+        self.seek03(SEEK_HOLE,   self.sparsesize, 1)
+        self.seek03(SEEK_HOLE, 2*self.sparsesize, 1)
 
         if self.deleg_stateid is None:
             # Run tests with byte range locking
             msg = " (locking file)"
-            self.seek03(SEEK_HOLE,   self.sparsesize, "seek04", 1, lock=True, msg=msg)
-            self.seek03(SEEK_HOLE, 2*self.sparsesize, "seek04", 1, lock=True, msg=msg)
+            self.seek03(SEEK_HOLE,   self.sparsesize, 1, lock=True, msg=msg)
+            self.seek03(SEEK_HOLE, 2*self.sparsesize, 1, lock=True, msg=msg)
 
 ################################################################################
 # Entry point

@@ -23,19 +23,18 @@ Furthermore, methods for finding specific NFSv4 operations within the packet
 trace are also included.
 """
 import os
-import re
-import time
-import subprocess
 from host import Host
+from formatstr import *
 import nfstest_config as c
-from packet.pktt import Pktt
+from packet.nfs.nfs3_const import *
 from packet.nfs.nfs4_const import *
+from nfstest.utils import split_path
 
 # Module constants
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "2.0"
+__version__   = "2.7"
 
 class NFSUtil(Host):
     """NFSUtil object
@@ -48,75 +47,76 @@ class NFSUtil(Host):
            # Create object for local host
            x = NFSUtil()
 
-           # Start packet trace
-           x.trace_start()
+           # Create client host object
+           clientobj = x.create_host('192.168.0.11')
 
-           # Stop packet trace
-           x.trace_stop()
+           # Use buffered matching on packets
+           x.set_pktlist()
 
-           # Open packet trace
-           x.trace_open()
+           # Get the next LOOKUP packets
+           pktcall, pktreply = x.find_nfs_op(OP_LOOKUP)
 
-           # Enable NFS kernel debug
-           x.nfs_debug_enable(nfsdebug='all'):
+           # Get OPEN information for the given file name
+           fh, open_stid, deleg_stid = x.find_open(filename="file1")
 
-           # Stop NFS kernel debug
-           x.nfs_debug_reset()
+           # Get address and port number from universal address string
+           ipaddr, port = x.get_addr_port(addr)
+
+           # Get packets and DS list for GETDEVICEINFO
+           pktcall, pktreply, dslist = x.find_getdeviceinfo()
+
+           # Get packets for EXCHANGE_ID
+           pktcall, pktreply = x.find_exchange_id()
+
+           # Get the NFS operation object from the given packet
+           getfh = x.getop(x.pktreply, OP_GETFH)
+
+           # Get the stateid which must be used by I/O operations
+           stateid = x.get_stateid("file1")
+
+           # Get the client id
+           clientid = x.get_clientid()
+
+           # Get the session id for the given clientid
+           sessionid = x.get_sessionid(clientid=clientid)
+
+           # Get the root file handle from PUTROOTFH for the given session id
+           x.get_rootfh(sessionid=sessionid)
+
+           # Get the file handle for the given path
+           dirfh = x.get_pathfh("/vol1/data")
+
+           # Display the state id in CRC16 format
+           stidstr = x.stid_str(stateid)
+
+           # Get the number of bytes available in the given directory
+           freebytes = x.get_freebytes("/mnt/t")
     """
     def __init__(self, **kwargs):
         """Constructor
 
            Initialize object's private data.
-
-           rpcdebug:
-               Set RPC kernel debug flags and save log messages [default: '']
-           nfsdebug:
-               Set NFS kernel debug flags and save log messages [default: '']
-           dbgname:
-               Base name for log messages files to create [default: 'dbgfile']
-           tracename:
-               Base name for trace files to create [default: 'tracefile']
-           trcdelay:
-               Seconds to delay before stopping packet trace [default: 0.0]
-           notrace:
-               Debug option so a trace is not actually started [default: False]
-           tcpdump:
-               Tcpdump command [default: '/usr/sbin/tcpdump']
-           messages:
-               Location of file for system messages [default: '/var/log/messages']
-           tmpdir:
-               Temporary directory where trace files are created [default: '/tmp']
-           tbsize:
-               Capture buffer size in kB [default: 50000]
         """
         # Arguments
-        self.rpcdebug  = kwargs.pop("rpcdebug",  '')
-        self.nfsdebug  = kwargs.pop("nfsdebug",  '')
-        self.dbgname   = kwargs.pop("dbgname",   'dbgfile')
-        self.tracename = kwargs.pop("tracename", 'tracefile')
-        self.trcdelay  = kwargs.pop("trcdelay",  0.0)
-        self.notrace   = kwargs.pop("notrace",   False)
-        self.tcpdump   = kwargs.pop("tcpdump",   c.NFSTEST_TCPDUMP)
-        self.messages  = kwargs.pop("messages",  c.NFSTEST_MESSAGESLOG)
-        self.tmpdir    = kwargs.pop("tmpdir",    c.NFSTEST_TMPDIR)
-        self.tbsize    = kwargs.pop("tbsize",    50000)
-        self._nfsdebug = False
+        self.pktcall   = None
+        self.pktreply  = None
+        self.opencall  = None
+        self.openreply = None
 
         # Initialize object variables
-        self.dbgidx = 1
-        self.dbgfile = ''
-        self.traceidx = 1
-        self.tracefile = ''
-        self.tracefiles = []
         self.clients = []
         self.clientobj = None
-        self.traceproc = None
         self.nii_name = ''    # nii_name for the client
         self.nii_server = ''  # nii_name for the server
         self.device_info = {}
         self.dslist = []
         self.stateid = None
-        self.dsismds = False
+        self.rootfh  = None
+        self.rootfsid = None
+        self.rootfh_map = {} # Root fh map {key:sessionid, value:rootfh}
+        self.sessionid_map = {} # Session id map {key:exchangeid, value:sessionid}
+        self.sessionid = None # Session ID returned from CREATE_SESSION
+        self.clientid = None # Client ID returned from EXCHANGE_ID
 
         # State id to string mapping
         self.stid_map = {}
@@ -144,10 +144,9 @@ class NFSUtil(Host):
     def __del__(self):
         """Destructor
 
-           Gracefully stop the packet trace and unreference all client
+           Gracefully stop the packet trace and un-reference all client
            objects
         """
-        self.trace_stop()
         self.clientobj = None
         while self.clients:
             self.clients.pop()
@@ -169,213 +168,178 @@ class NFSUtil(Host):
             datadir      = kwargs.pop("datadir",      self.datadir),
             mtopts       = kwargs.pop("mtopts",       self.mtopts),
             nomount      = kwargs.pop("nomount",      self.nomount),
+            tracename    = kwargs.pop("tracename",    self.tracename),
+            trcdelay     = kwargs.pop("trcdelay",     self.trcdelay),
+            tcpdump      = kwargs.pop("tcpdump",      self.tcpdump),
+            tbsize       = kwargs.pop("tbsize",       self.tbsize),
+            notrace      = kwargs.pop("notrace",      self.notrace),
+            rpcdebug     = kwargs.pop("rpcdebug",     self.rpcdebug),
+            nfsdebug     = kwargs.pop("nfsdebug",     self.nfsdebug),
+            dbgname      = kwargs.pop("dbgname",      self.dbgname),
+            messages     = kwargs.pop("messages",     self.messages),
+            tmpdir       = kwargs.pop("tmpdir",       self.tmpdir),
+            iptables     = kwargs.pop("iptables",     self.iptables),
             sudo         = kwargs.pop("sudo",         self.sudo),
         )
 
         self.clients.append(self.clientobj)
         return self.clientobj
 
-    def trace_start(self, tracefile=None, interface=None, capsize=None, clients=None):
-        """Start trace on interface given
+    def set_pktlist(self, ops=None, cbs=None, procs=None, maxindex=None, pktdisp=False):
+        """Set the current packet list for buffered matching in which the
+           match method will only use this list instead of getting the next
+           packet from the packet trace file. The default is to get all
+           packets unless any of the arguments is given.
 
-           tracefile:
-               Name of trace file to create, default is a unique name
-               created in the temporary directory using self.tracename as the
-               base name.
-           capsize:
-               Use the -C option of tcpdump to split the trace files every
-               1000000*capsize bytes. See documentation for tcpdump for more
-               information
-           clients:
-               List of Host() objects to monitor
+           NOTE: all READ reply data and all WRITE request data is discarded
+           to avoid having memory issues.
 
-           Return the name of the trace file created.
+           ops:
+               List of NFSv4 operations to include in the packet list
+           cbs:
+               List of NFSv4 callback operations to include in the packet list
+           procs:
+               List of NFSv3 procedures to include in the packet list
+           maxindex:
+               Include packets up to but not including the packet indexed
+               by this argument [default: None]
+               A value of None means there is no limit
+           pktdisp:
+               Display all cached packets [default: False]
         """
-        self.trace_stop()
-        if tracefile:
-            self.tracefile = tracefile
-        else:
-            self.tracefile = "%s/%s_%d.cap" % (self.tmpdir, self.tracename, self.traceidx)
-            self.traceidx += 1
-        if not self.notrace:
-            if len(self.nfsdebug) or len(self.rpcdebug):
-                self.nfs_debug_enable()
-            self.tracefiles.append(self.tracefile)
+        pktlist = []
+        # Default behavior when no list is given
+        defexpr = ops is None and cbs is None and procs is None
+        # Boolean expressions for each of the lists
+        ops_expr   = not defexpr and ops   is not None
+        cbs_expr   = not defexpr and cbs   is not None
+        procs_expr = not defexpr and procs is not None
+        for pkt in self.pktt:
+            # Get list of NFS packets
+            if pkt == "nfs":
+                if maxindex is not None and pkt.record.index >= maxindex:
+                    break
 
-            if clients is None:
-                clients = self.clients
+                rpc = pkt.rpc
+                if rpc.procedure == 0:
+                    # NULL procedure
+                    if not defexpr and (not procs_expr or 0 not in procs):
+                        continue
+                elif (rpc.version == 4 and not pkt.nfs.callback) or \
+                     (rpc.version == 1 and pkt.nfs.callback):
+                    # NFSv4 COMPOUND and callback
+                    incl_pkt = False
+                    for item in pkt.nfs.array:
+                        op = item.op
+                        # Discard data from read and write packets so memory
+                        # is not an issue. Do this before selecting operations
+                        # in case a READ or WRITE packet is selected by any
+                        # of the other operations in the array
+                        if op == OP_READ and rpc.type == 1:
+                            item.opread.resok.data = ""
+                        elif op == OP_WRITE and rpc.type == 0:
+                            item.opwrite.data = ""
+                        if not defexpr:
+                            # If any of the lists is given, make sure to
+                            # include only operations in the given lists
+                            if pkt.nfs.callback:
+                                if not cbs_expr or op not in cbs:
+                                    continue
+                            else:
+                                if not ops_expr or op not in ops:
+                                    continue
+                        incl_pkt = True
+                    if not incl_pkt:
+                        continue
+                elif rpc.version == 3:
+                    # NFSv3 procedures
+                    procedure = pkt.nfs.procedure
+                    # If the procs list is given, make sure to include only
+                    # procedures given in the list
+                    if not defexpr and (not procs_expr or procedure not in procs):
+                        continue
+                    # Discard data from read and write packets
+                    # so memory is not an issue
+                    if procedure == NFSPROC3_READ and rpc.type == 1:
+                        pkt.nfs.opread.resok.data = ""
+                    elif procedure == NFSPROC3_WRITE and rpc.type == 0:
+                        pkt.nfs.opwrite.data = ""
+                pktlist.append(pkt)
+                if pktdisp:
+                    self.test_info(str(pkt))
+        self.pktt.set_pktlist(pktlist)
 
-            if interface is None:
-                interface = self.interface
-
-            opts = ""
-            if interface is not None:
-                opts += " -i %s" % interface
-
-            if capsize:
-                opts += " -C %d" % capsize
-
-            hosts = self.ipaddr
-            for cobj in clients:
-                hosts += " or %s" % cobj.ipaddr
-
-            cmd = "%s%s -n -B %d -s 0 -w %s host %s" % (self.tcpdump, opts, self.tbsize, self.tracefile, hosts)
-            self.run_cmd(cmd, sudo=True, dlevel='DBG2', msg="Trace start: ", wait=False)
-            self.traceproc = self.process
-
-            # Make sure tcpdump has started
-            out = self.traceproc.stderr.readline()
-            if not re.search('listening on', out):
-                time.sleep(1)
-                if self.process.poll() is not None:
-                    raise Exception(out)
-        return self.tracefile
-
-    def trace_stop(self):
-        """Stop the trace started by trace_start()."""
-        try:
-            if self.traceproc:
-                self.dprint('DBG2', "Trace stop")
-                time.sleep(self.trcdelay)
-                self.run_cmd("killall tcpdump", sudo=True, dlevel='DBG2')
-                self.stop_cmd(self.traceproc)
-                self.traceproc = None
-            if not self.notrace and self._nfsdebug:
-                self.nfs_debug_reset()
-        except:
-            return
-
-    def trace_open(self, tracefile=None, **kwargs):
-        """Open the trace file given or the trace file started by trace_start().
-
-           All extra options are passed directly to the packet trace object.
-
-           Return the packet trace object created, the packet trace object
-           is also stored in the object attribute pktt.
-        """
-        if tracefile is None:
-            tracefile = self.tracefile
-        self.dprint('DBG1', "trace_open [%s]" % tracefile)
-        self.pktt = Pktt(tracefile, **kwargs)
-        return self.pktt
-
-    def nfs_debug_enable(self, **kwargs):
-        """Enable NFS debug messages.
-
-           rpcdebug:
-               Set RPC kernel debug flags and save log messages [default: self.rpcdebug]
-           nfsdebug:
-               Set NFS kernel debug flags and save log messages [default: self.nfsdebug]
-           dbgfile:
-               Name of log messages file to create, default is a unique name
-               created in the temporary directory using self.dbgname as the
-               base name.
-        """
-        modmsgs = {
-            'nfs': kwargs.pop('nfsdebug', self.nfsdebug),
-            'rpc': kwargs.pop('rpcdebug', self.rpcdebug),
-        }
-        dbgfile = kwargs.pop('dbgfile', None)
-        if dbgfile is not None:
-            self.dbgfile = dbgfile
-        else:
-            self.dbgfile = "%s/%s_%d.msg" % (self.tmpdir, self.dbgname, self.dbgidx)
-            self.dbgidx += 1
-
-        if modmsgs['nfs'] is None and modmsgs['rpc'] is None:
-            return
-
-        if os.path.exists(self.messages):
-            fstat = os.stat(self.messages)
-            self.dbgoffset = fstat.st_size
-            self.dbgmode = fstat.st_mode & 0777
-            for mod in modmsgs.keys():
-                if len(modmsgs[mod]):
-                    self._nfsdebug = True
-                    cmd = "rpcdebug -v -m %s -s %s" % (mod, modmsgs[mod])
-                    self.run_cmd(cmd, sudo=True, dlevel='DBG2', msg="NFS debug enable: ")
-
-    def nfs_debug_reset(self):
-        """Reset NFS debug messages."""
-        for mod in ('nfs', 'rpc'):
-            try:
-                cmd = "rpcdebug -v -m %s -c" % mod
-                self.run_cmd(cmd, sudo=True, dlevel='DBG2', msg="NFS debug reset: ")
-            except:
-                pass
-
-        if self.dbgoffset != None:
-            try:
-                fd = None
-                fdw = None
-                os.system(self.sudo_cmd("chmod %o %s" % (self.dbgmode|0444, self.messages)))
-                self.dprint('DBG2', "Creating log messages file [%s]" % self.dbgfile)
-                fdw = open(self.dbgfile, "w")
-                fd = open(self.messages, "r")
-                fd.seek(self.dbgoffset)
-                while True:
-                    data = fd.read(self.rsize)
-                    if len(data) == 0:
-                        break
-                    fdw.write(data)
-            except Exception as e:
-                raise
-            finally:
-                if fd:
-                    fd.close()
-                if fdw:
-                    fdw.close()
-                os.system(self.sudo_cmd("chmod %o %s" % (self.dbgmode, self.messages)))
-
-    def find_nfs_op(self, op, ipaddr, port=None, match='', status=0, src_ipaddr=None, maxindex=None, call_only=False):
+    def find_nfs_op(self, op, **kwargs):
         """Find the call and its corresponding reply for the specified NFSv4
            operation going to the server specified by the ipaddr and port.
-           The reply must also match the given status.
+           The reply must also match the given status. Also the following
+           object attributes are defined: pktcall referencing the packet call
+           while pktreply referencing the packet reply.
 
            op:
                NFS operation to find
            ipaddr:
-               Destination IP address
+               Destination IP address [default: self.server_ipaddr]
+               A value of None matches any IP address
            port:
-               Destination port [default: any destination port]
+               Destination port [default: self.port]
+               A value of None matches any destination port
            match:
                Match string to include [default: '']
            status:
                Match the status of the operation [default: 0]
+               A value of None matches any status.
            src_ipaddr:
-               Source IP address [default: any IP address]
+               Source IP address [default: None]
+               A value of None matches any IP address
            maxindex:
-               The match fails if packet index hits this limit [default: no limit]
+               The match fails if packet index hits this limit [default: None]
+               A value of None means there is no limit
            call_only:
                Find the call only [default: False]
 
            Return a tuple: (pktcall, pktreply).
         """
+        ipaddr       = kwargs.get("ipaddr",       self.server_ipaddr)
+        port         = kwargs.get("port",         self.port)
+        match        = kwargs.get("match",        "")
+        status       = kwargs.get("status",       0)
+        src_ipaddr   = kwargs.get("src_ipaddr",   None)
+        maxindex     = kwargs.get("maxindex",     None)
+        call_only    = kwargs.get("call_only",    False)
+
         mstatus = "" if status is None else "NFS.status == %d and " % status
         src = "IP.src == '%s' and " % src_ipaddr if src_ipaddr != None else ''
-        dst = "IP.dst == '%s' and " % ipaddr
+        dst = "IP.dst == '%s' and " % ipaddr if ipaddr is not None else ""
         if len(match):
             match += " and "
         if port != None:
             dst += "TCP.dst_port == %d and " % port
-        pktcall   = None
-        pktreply  = None
+        pktcall  = None
+        pktreply = None
         while True:
             # Find request
             pktcall = self.pktt.match(src + dst + match + "NFS.argop == %d" % op, maxindex=maxindex)
             if pktcall and not call_only:
                 # Find reply
                 xid = pktcall.rpc.xid
-                pktreply = self.pktt.match("RPC.xid == %d and %s NFS.resop == %d" % (xid, mstatus, op), maxindex=maxindex)
+                # Include OP_ILLEGAL in case server does not know about the
+                # operation in question
+                pktreply = self.pktt.match("RPC.xid == %d and %s NFS.resop in (%d,%d)" % (xid, mstatus, op, OP_ILLEGAL), maxindex=maxindex)
                 if pktreply:
                     break
             else:
                 break
+        self.pktcall  = pktcall
+        self.pktreply = pktreply
         return (pktcall, pktreply)
 
     def find_open(self, **kwargs):
         """Find the call and its corresponding reply for the NFSv4 OPEN of the
            given file going to the server specified by the ipaddr and port.
+           The following object attributes are defined: opencall and pktcall
+           both referencing the packet call while openreply and pktreply both
+           referencing the packet reply.
 
            filename:
                Find open call and reply for this file [default: None]
@@ -383,7 +347,7 @@ class NFSUtil(Host):
                Find open call and reply for this file handle using CLAIM_FH
                [default: None]
            ipaddr:
-               Destination IP address [default: self.server]
+               Destination IP address [default: self.server_ipaddr]
            port:
                Destination port [default: self.port]
            deleg_type:
@@ -392,7 +356,8 @@ class NFSUtil(Host):
                Delegation stateid expected on call in delegate_cur_info [default: None]
            fh:
                Find open call and reply for this file handle when using
-               deleg_stateid [default: None]
+               deleg_stateid or as the directory FH when deleg_stateid
+               is not set [default: None]
            src_ipaddr:
                Source IP address [default: any IP address]
            maxindex:
@@ -413,6 +378,10 @@ class NFSUtil(Host):
         src_ipaddr    = kwargs.pop('src_ipaddr', None)
         maxindex      = kwargs.pop('maxindex', None)
         anyclaim      = kwargs.pop('anyclaim', False)
+        self.pktcall  = None
+        self.pktreply = None
+        self.opencall  = None
+        self.openreply = None
 
         src = "IP.src == '%s' and " % src_ipaddr if src_ipaddr is not None else ''
         dst = self.pktt.ip_tcp_dst_expr(ipaddr, port)
@@ -426,7 +395,6 @@ class NFSUtil(Host):
             str_list.append(file_str)
         if claimfh is not None:
             claimfh_str = "(NFS.fh == '%s' and NFS.claim.claim == %d)" % (self.pktt.escape(claimfh), CLAIM_FH)
-            claimfh_str = "(crc32(NFS.fh) == %s and NFS.claim.claim == %d)" % (self.format("{0:crc32}", claimfh), CLAIM_FH)
             str_list.append(claimfh_str)
         if deleg_stateid is not None:
             deleg_str  = "(NFS.claim.claim == %d" % CLAIM_DELEGATE_CUR
@@ -436,6 +404,10 @@ class NFSUtil(Host):
                 deleg_str += " or (NFS.claim.claim == %d" % CLAIM_DELEG_CUR_FH
                 deleg_str += " and NFS.fh == '%s' and NFS.claim.stateid == '%s')" % (self.pktt.escape(fh), self.pktt.escape(deleg_stateid))
             str_list.append("(" + deleg_str + ")")
+        if claimfh is None and deleg_stateid is None and fh is not None:
+            dirfh_str = "NFS.fh == '%s'" % self.pktt.escape(fh)
+            file_str = dirfh_str + " and " + file_str
+            str_list.append(dirfh_str)
 
         if anyclaim:
             file_str = " or ".join(str_list)
@@ -485,6 +457,10 @@ class NFSUtil(Host):
             else:
                 deleg_stateid = None
 
+            self.pktcall  = pktcall
+            self.pktreply = pktreply
+            self.opencall  = pktcall
+            self.openreply = pktreply
             return (filehandle, open_stateid, deleg_stateid)
 
     def find_layoutget(self, filehandle):
@@ -540,6 +516,18 @@ class NFSUtil(Host):
 
         return (layoutget, layoutget_res, loc_body)
 
+    def get_addr_port(self, addr):
+        """Get address and port number from universal address string"""
+        addr_list = addr.split('.')
+        if len(addr_list) == 6:
+            # IPv4 address
+            ipaddr = '.'.join(addr_list[:4])
+        else:
+            # IPv6 address
+            ipaddr = addr_list[0]
+        port = (int(addr_list[-2])<<8) + int(addr_list[-1])
+        return ipaddr, port
+
     def find_getdeviceinfo(self, deviceid=None):
         """Find the call and its corresponding reply for the NFSv4 GETDEVICEINFO
            going to the server specified by the ipaddr for self.server and port
@@ -553,7 +541,7 @@ class NFSUtil(Host):
         dslist = []
         # Find GETDEVICEINFO request and reply
         match = "NFS.deviceid == '%s'" % self.pktt.escape(deviceid) if deviceid is not None else ''
-        (pktcall, pktreply) = self.find_nfs_op(OP_GETDEVICEINFO, self.server_ipaddr, self.port, match=match, status=None)
+        (pktcall, pktreply) = self.find_nfs_op(OP_GETDEVICEINFO, match=match, status=None)
         if pktreply and pktreply.nfs.status == 0:
             self.gdir_device = pktreply.NFSop.device_addr
             if self.gdir_device.type == LAYOUT4_NFSV4_1_FILES:
@@ -562,12 +550,11 @@ class NFSUtil(Host):
                 multipath_ds_list = da_addr_body.multipath_ds_list
 
                 for ds_list in multipath_ds_list:
+                    dslist.append([])
                     for item in ds_list:
                         # Get ip address and port for DS
-                        addr_list = item.addr.split('.')
-                        ipaddr = '.'.join(addr_list[:4])
-                        port = (int(addr_list[4])<<8) + int(addr_list[5])
-                        dslist.append({'ipaddr': ipaddr, 'port': port})
+                        ipaddr, port = self.get_addr_port(item.addr)
+                        dslist[-1].append({'ipaddr': ipaddr, 'port': port})
             # Save device info for future reference
             self.device_info[pktcall.NFSop.deviceid] = {
                 'call':  pktcall,
@@ -582,7 +569,7 @@ class NFSUtil(Host):
            going to the server specified by the ipaddr and port.
 
            ipaddr:
-               Destination IP address [default: self.server]
+               Destination IP address [default: self.server_ipaddr]
            port:
                Destination port [default: self.port]
 
@@ -590,10 +577,8 @@ class NFSUtil(Host):
 
            Return a tuple: (pktcall, pktreply).
         """
-        ipaddr = kwargs.pop('ipaddr', self.server_ipaddr)
-        port   = kwargs.pop('port', self.port)
         # Find EXCHANGE_ID request and reply
-        (pktcall, pktreply) = self.find_nfs_op(OP_EXCHANGE_ID, ipaddr, port)
+        (pktcall, pktreply) = self.find_nfs_op(OP_EXCHANGE_ID, **kwargs)
         self.src_ipaddr = pktcall.ip.src
         self.src_port   = pktcall.tcp.src_port
         self.cb_dst     = self.pktt.ip_tcp_dst_expr(self.src_ipaddr, self.src_port)
@@ -681,6 +666,56 @@ class NFSUtil(Host):
             ds_index += nfhs
         return n == m and idx == ds_index
 
+    def getop(self, pkt, op):
+        """Get the NFS operation object from the given packet"""
+        if pkt:
+            # Start looking for the operation after NFSidx if it exists
+            if hasattr(pkt, "NFSidx"):
+                idx = pkt.NFSidx + 1
+            else:
+                idx = 0
+            array = pkt.nfs.array
+            while (idx < len(array) and array[idx].op != op):
+                idx += 1
+            if idx < len(array):
+                # Return the operation object
+                return pkt.nfs.array[idx]
+        return
+
+    def verify_pnfs_supported(self, filehandle, server_type, path=None):
+        """Verify pNFS is supported in the given server path.
+           Finds the GETATTR asking for FATTR4_SUPPORTED_ATTRS(bit 0 and its
+           reply to verify FATTR4_FS_LAYOUT_TYPES is supported for the path.
+           Then it finds the GETATTR asking for FATTR4_FS_LAYOUT_TYPES(bit 62)
+           to verify LAYOUT4_NFSV4_1_FILES is returned in fs_layout_types.
+        """
+        if path:
+            pmsg = " for %s" % path
+        else:
+            pmsg = ""
+        fhstr = self.pktt.escape(filehandle)
+        # Find packet having a GETATTR asking for FATTR4_SUPPORTED_ATTRS(bit 0)
+        attrmatch = "NFS.fh == '%s' and NFS.request & %s != 0" % (fhstr, hex(1 << FATTR4_SUPPORTED_ATTRS))
+        pktcall, pktreply = self.find_nfs_op(OP_GETATTR, match=attrmatch)
+        self.test(pktcall, "GETATTR should be sent to %s asking for FATTR4_SUPPORTED_ATTRS%s" % (server_type, pmsg))
+        if pktreply:
+            supported_attrs = pktreply.NFSop.attributes[FATTR4_SUPPORTED_ATTRS]
+            fslt_supported = supported_attrs & (1<<FATTR4_FS_LAYOUT_TYPES) != 0
+            self.test(fslt_supported, "NFS server should support pNFS layout types (FATTR4_FS_LAYOUT_TYPES)%s" % pmsg)
+        elif pktcall:
+            self.test(False, "GETATTR reply was not found")
+
+        # Find packet having a GETATTR asking for FATTR4_FS_LAYOUT_TYPES(bit 62)
+        attrmatch = "NFS.fh == '%s' and NFS.request & %s != 0" % (fhstr, hex(1 << FATTR4_FS_LAYOUT_TYPES))
+        pktcall, pktreply = self.find_nfs_op(OP_GETATTR, match=attrmatch)
+        self.test(pktcall, "GETATTR should be sent to %s asking for FATTR4_FS_LAYOUT_TYPES%s" % (server_type, pmsg))
+        if pktreply:
+            # Get list of fs layout types supported by the server
+            fs_layout_types = pktreply.NFSop.attributes[FATTR4_FS_LAYOUT_TYPES]
+            self.test(LAYOUT4_NFSV4_1_FILES in fs_layout_types, "NFS server should return LAYOUT4_NFSV4_1_FILES in fs_layout_types%s" % pmsg)
+        elif pktcall:
+            self.test(False, "GETATTR reply was not found")
+
     def verify_create_session(self, ipaddr, port, ds=False, nocreate=False, ds_index=None, exchid_status=0, cs_status=0):
         """Verify initial connection to the metadata server(MDS)/data server(DS).
            Verify if EXCHANGE_ID, CREATE_SESSION, RECLAIM_COMPLETE,
@@ -723,8 +758,19 @@ class NFSUtil(Host):
             nocreate = True
             dsmds = " since DS == MDS"
 
+        if not ds:
+            save_index = self.pktt.get_index()
+            # Find PUTROOTFH having a GETFH operation
+            getfhmatch = "NFS.argop == %d" % OP_GETFH
+            pktcall, pktreply = self.find_nfs_op(OP_PUTROOTFH, ipaddr=ipaddr, port=port, match=getfhmatch)
+            self.rootfh = getattr(self.getop(pktreply, OP_GETFH), "fh", None)
+            attributes  = getattr(self.getop(pktreply, OP_GETATTR), "attributes", None)
+            if attributes:
+                self.rootfsid = attributes.get(FATTR4_FSID)
+            self.pktt.rewind(save_index)
+
         # Find EXCHANGE_ID request and reply
-        (pktcall, pktreply) = self.find_nfs_op(OP_EXCHANGE_ID, ipaddr, port, status=exchid_status)
+        (pktcall, pktreply) = self.find_nfs_op(OP_EXCHANGE_ID, ipaddr=ipaddr, port=port, status=exchid_status)
         if nocreate:
             self.test(not pktcall, "EXCHANGE_ID should not be sent to %s%s" % (server_type, dsmds))
         else:
@@ -745,7 +791,7 @@ class NFSUtil(Host):
                 self.test(False, "EXCHANGE_ID reply was not found")
 
         # Find CREATE_SESSION request
-        (pktcall, pktreply) = self.find_nfs_op(OP_CREATE_SESSION, ipaddr, port, status=cs_status)
+        (pktcall, pktreply) = self.find_nfs_op(OP_CREATE_SESSION, ipaddr=ipaddr, port=port, status=cs_status)
         if nocreate:
             self.test(not pktcall, "CREATE_SESSION should not be sent to %s%s" % (server_type, dsmds))
         else:
@@ -759,23 +805,26 @@ class NFSUtil(Host):
                     self.sessionid = pktreply.NFSop.sessionid
                     # Save the max response size
                     self.ca_maxrespsz = pktreply.NFSop.fore_chan_attrs.maxresponsesize
+                    self.dprint('DBG2', "CREATE_SESSION sessionid: %s" % self.sessionid)
+                    self.dprint('DBG2', "CREATE_SESSION ca_maxrespsz: %s" % self.ca_maxrespsz)
 
-                    slotid = 0
                     fmsg = None
                     test_seq = True
-                    save_index = self.pktt.index
-                    while True:
-                        # Find first SEQUENCE request per slot id
-                        (pktcall, pktreply) = self.find_nfs_op(OP_SEQUENCE, ipaddr, port, call_only=True, match="NFS.slotid == %d" % slotid)
-                        if pktcall is None:
+                    slotid_map = {}
+                    save_index = self.pktt.get_index()
+                    while self.find_nfs_op(OP_SEQUENCE, ipaddr=ipaddr, port=port, call_only=True):
+                        if self.pktcall is None:
                             break
-                        self.pktt.rewind(save_index)
-                        slotid += 1
-                        if pktcall.NFSop.sequenceid != 1:
-                            fmsg = ", slot id %d starts with sequence id %d" % (slotid-1, pktcall.NFSop.sequenceid)
-                            test_seq = False
-                            break
-                    if slotid > 0:
+                        slotid = self.pktcall.NFSop.slotid
+                        seqid  = self.pktcall.NFSop.sequenceid
+                        if slotid_map.get(slotid) is None:
+                            # First occurrence of slot id
+                            slotid_map[slotid] = seqid
+                            if seqid != 1:
+                                fmsg = ", slot id %d starts with sequence id %d" % (slotid, seqid)
+                                test_seq = False
+                                break
+                    if len(slotid_map) > 0:
                         self.test(test_seq, "SEQUENCE request should start with a sequence id of 1", failmsg=fmsg)
                     else:
                         self.test(False, "SEQUENCE request was not found")
@@ -784,7 +833,7 @@ class NFSUtil(Host):
                 self.test(False, "CREATE_SESSION reply was not found")
 
         # Find RECLAIM_COMPLETE request
-        (pktcall, pktreply) = self.find_nfs_op(OP_RECLAIM_COMPLETE, ipaddr, port, status=None)
+        (pktcall, pktreply) = self.find_nfs_op(OP_RECLAIM_COMPLETE, ipaddr=ipaddr, port=port, status=None)
         if nocreate:
             self.test(not pktcall, "RECLAIM_COMPLETE should not be sent to %s%s" % (server_type, dsmds))
         else:
@@ -797,7 +846,7 @@ class NFSUtil(Host):
         if not ds:
             # Find packet having a GETATTR asking for FATTR4_LEASE_TIME(bit 10)
             attrmatch = "NFS.request & %s != 0" % hex(1 << FATTR4_LEASE_TIME)
-            (pktcall, pktreply) = self.find_nfs_op(OP_GETATTR, self.server_ipaddr, self.port, match=attrmatch)
+            (pktcall, pktreply) = self.find_nfs_op(OP_GETATTR, match=attrmatch)
             self.test(pktcall, "GETATTR should be sent to %s asking for FATTR4_LEASE_TIME" % server_type)
             if pktreply:
                 lease_time = pktreply.NFSop.attributes[FATTR4_LEASE_TIME]
@@ -805,27 +854,50 @@ class NFSUtil(Host):
             elif pktcall:
                 self.test(False, "GETATTR reply was not found")
 
-            # Find packet having a GETATTR asking for FATTR4_SUPPORTED_ATTRS(bit 0)
-            attrmatch = "NFS.request & %s != 0" % hex(1 << FATTR4_SUPPORTED_ATTRS)
-            (pktcall, pktreply) = self.find_nfs_op(OP_GETATTR, self.server_ipaddr, self.port, match=attrmatch)
-            self.test(pktcall, "GETATTR should be sent to %s asking for FATTR4_SUPPORTED_ATTRS" % server_type)
-            if pktreply:
-                supported_attrs = pktreply.NFSop.attributes[FATTR4_SUPPORTED_ATTRS]
-                fslt_supported = supported_attrs & (1<<FATTR4_FS_LAYOUT_TYPES) != 0
-                self.test(fslt_supported, "NFS server should support file type layouts (LAYOUT4_NFSV4_1_FILES)")
-            elif pktcall:
-                self.test(False, "GETATTR reply was not found")
+            self.verify_pnfs_supported(self.rootfh, server_type)
+            save_index = self.pktt.get_index()
 
-            # Find packet having a GETATTR asking for FATTR4_FS_LAYOUT_TYPES(bit 62)
-            attrmatch = "NFS.request & %s != 0" % hex(1 << FATTR4_FS_LAYOUT_TYPES)
-            (pktcall, pktreply) = self.find_nfs_op(OP_GETATTR, self.server_ipaddr, self.port, match=attrmatch)
-            self.test(pktcall, "GETATTR should be sent to %s asking for FATTR4_FS_LAYOUT_TYPES" % server_type)
-            if pktreply:
-                # Get list of fs layout types supported by the server
-                fs_layout_types = pktreply.NFSop.attributes[FATTR4_FS_LAYOUT_TYPES]
-                self.test(LAYOUT4_NFSV4_1_FILES in fs_layout_types, "NFS server should return LAYOUT4_NFSV4_1_FILES in fs_layout_types")
-            elif pktcall:
-                self.test(False, "GETATTR reply was not found")
+            # Find if pNFS is supported for the mounted path including datadir
+            path_list = []
+            if len(self.datadir):
+                path = os.path.join(self.export, self.datadir)
+            else:
+                path = self.export
+            while True:
+                plist = os.path.split(path)
+                if plist[1] == "":
+                    break
+                path_list.insert(0, plist[1])
+                path = plist[0]
+            fullpath = "/"
+            fsid_list = []
+            if self.rootfsid is not None:
+                fsid_list.append(self.rootfsid)
+            for path in path_list:
+                # Find the LOOKUP
+                fullpath = os.path.join(fullpath, path)
+                match = "NFS.name == '%s'" % path
+                pktcall, pktreply = self.find_nfs_op(OP_LOOKUP, match=match)
+                if pktreply:
+                    getfh_obj   = self.getop(pktreply, OP_GETFH)
+                    getattr_obj = self.getop(pktreply, OP_GETATTR)
+                    if getfh_obj is None or getattr_obj is None:
+                        # Could not find GETFH or GETATTR
+                        continue
+                    filehandle = getfh_obj.fh
+                    attributes = getattr_obj.attributes
+                    fsid = attributes.get(FATTR4_FSID)
+                    for xfsid in fsid_list:
+                        if fsid.major == xfsid.major and fsid.minor == xfsid.minor:
+                            # This fsid has already been verified, so skip it
+                            fsid = None
+                            break
+                    if fsid is not None:
+                        # Save the fsid so it won't be verified again
+                        fsid_list.append(fsid)
+                        # Verify this path supports pNFS
+                        self.verify_pnfs_supported(filehandle, server_type, path=fullpath)
+            self.pktt.rewind(save_index)
         return self.sessionid
 
     def verify_layoutget(self, filehandle, iomode, riomode=None, status=0, offset=None, length=None):
@@ -890,8 +962,8 @@ class NFSUtil(Host):
         # Test LAYOUTGET reply for correct iomode
         if riomode is not None:
             self.test(layout.iomode == riomode, "LAYOUTGET reply iomode is %s when asking for a %s layout" % (self.iomode_str(riomode), self.iomode_str(iomode)))
-        elif iomode == 1 and layoutget.iomode in [LAYOUTIOMODE4_READ, LAYOUTIOMODE4_RW]:
-            self.test(True, "LAYOUTGET reply iomode is %s when asking for a IOMODE_READ layout" % self.iomode_str(layoutget.iomode))
+        elif iomode == LAYOUTIOMODE4_READ and layoutget.iomode in [LAYOUTIOMODE4_READ, LAYOUTIOMODE4_RW]:
+            self.test(True, "LAYOUTGET reply iomode is %s when asking for a LAYOUTIOMODE4_READ layout" % self.iomode_str(layoutget.iomode))
         else:
             self.test(layout.iomode == iomode, "LAYOUTGET reply iomode should be %s" % self.iomode_str(iomode))
 
@@ -953,7 +1025,7 @@ class NFSUtil(Host):
             if port != None:
                 dst += "TCP.dst_port == %d and " % port
         fh = "NFS.fh == '%s'" % self.pktt.escape(filehandle)
-        save_index = self.pktt.index
+        save_index = self.pktt.get_index()
         xids = []
         offsets = {}
         good_pattern = 0
@@ -1000,15 +1072,13 @@ class NFSUtil(Host):
             # Get real file offset
             file_offset = self.get_abs_offset(nfsop.offset, ds_index)
 
-            if iomode == LAYOUTIOMODE4_READ:
-                size = nfsop.count
-            else:
+            size = nfsop.count
+            if iomode != LAYOUTIOMODE4_READ:
                 data = self.data_pattern(file_offset, len(nfsop.data), pattern=pattern)
                 if data != nfsop.data:
                     bad_pattern += 1
                 else:
                     good_pattern += 1
-                size = len(nfsop.data)
             if self.max_iosize < size:
                 self.max_iosize = size
 
@@ -1028,6 +1098,9 @@ class NFSUtil(Host):
 
         if len(xids) == 0:
             return 0
+
+        # Flag showing if this DS is the same as the MDS
+        dsismds = (ipaddr == self.server_ipaddr and port == self.port)
 
         # Find all I/O replies for MDS or current DS
         while True:
@@ -1055,7 +1128,7 @@ class NFSUtil(Host):
                         good_pattern += 1
                 else:
                     if pkt.nfs.status == NFS4_OK:
-                        if not self.dsismds:
+                        if not dsismds:
                             self.mdsd_lcommit = True
                         if nfsop.committed < FILE_SYNC4:
                             # Need layout commit if reply is not FILE_SYNC4
@@ -1117,7 +1190,7 @@ class NFSUtil(Host):
         """
         dst = self.pktt.ip_tcp_dst_expr(ipaddr, port)
         fh = "NFS.fh == '%s'" % self.pktt.escape(filehandle)
-        save_index = self.pktt.index
+        save_index = self.pktt.get_index()
         xids = []
         if init:
             self.test_commit_full = True
@@ -1219,17 +1292,26 @@ class NFSUtil(Host):
             self.test(getattr_res.attributes[FATTR4_SIZE] == filesize, "GETATTR should return correct file size within LAYOUTCOMMIT compound")
         return
 
-    def get_stateid(self, filename):
+    def get_stateid(self, filename, **kwargs):
         """Search the packet trace for the file name given to get the OPEN
            so all related state ids can be searched. A couple of object
            attributes are defined, one is the correct state id that should
            be used by I/O operations. The second is a dictionary table
            which maps the state id to a string identifying if the state
            id is an open, lock or delegation state id.
+
+           ipaddr:
+               Destination IP address [default: self.server_ipaddr]
+           port:
+               Destination port [default: self.port]
+           noreset:
+               Do not reset the state id map [default: False]
         """
-        self.stid_map = {}
+        noreset = kwargs.pop("noreset", False)
+        if not noreset:
+            self.stid_map = {}
         self.lock_stateid = None
-        (self.filehandle, self.open_stateid, self.deleg_stateid) = self.find_open(filename=filename)
+        (self.filehandle, self.open_stateid, self.deleg_stateid) = self.find_open(filename=filename, **kwargs)
         if self.open_stateid:
             self.stid_map[self.open_stateid] = "OPEN stateid"
         if self.deleg_stateid:
@@ -1238,9 +1320,11 @@ class NFSUtil(Host):
             self.stid_map[self.deleg_stateid] = "DELEG stateid"
         else:
             # Look for a lock stateid
-            save_index = self.pktt.index
-            mstr = "NFS.fh == '%s'" % self.pktt.escape(self.filehandle)
-            (pktcall, pktreply) = self.find_nfs_op(OP_LOCK, self.server_ipaddr, self.port, match=mstr)
+            save_index = self.pktt.get_index()
+            argl = ("ipaddr", "port")
+            args = dict((k, kwargs[k]) for k in kwargs if k in argl)
+            args["match"] = "NFS.fh == '%s'" % self.pktt.escape(self.filehandle)
+            (pktcall, pktreply) = self.find_nfs_op(OP_LOCK, **args)
             if pktreply:
                 self.lock_stateid = pktreply.NFSop.stateid.other
                 self.stid_map[self.lock_stateid] = "LOCK stateid"
@@ -1250,6 +1334,126 @@ class NFSUtil(Host):
                 self.stateid = self.open_stateid
             self.pktt.rewind(save_index)
         return self.stateid
+
+    def get_clientid(self, **kwargs):
+        """Return the client id for the given IP address and port number.
+
+           ipaddr:
+               Destination IP address [default: self.server_ipaddr]
+           port:
+               Destination port [default: self.port]
+        """
+        self.clientid = None
+        if self.nfsversion > 4:
+            # Find the EXCHANGE_ID packets
+            self.find_nfs_op(OP_EXCHANGE_ID, **kwargs)
+            if self.pktreply:
+                self.clientid = self.pktreply.NFSop.clientid
+        elif self.nfsversion == 4:
+            # Find the SETCLIENTID packets
+            self.find_nfs_op(OP_SETCLIENTID, **kwargs)
+            if self.pktreply:
+                self.clientid = self.pktreply.NFSop.clientid
+        return self.clientid
+
+    def get_sessionid(self, **kwargs):
+        """Return the session id for the given IP address and port number.
+
+           clientid:
+               Search the CREATE_SESSION tied to this client id [default: None]
+           ipaddr:
+               Destination IP address [default: self.server_ipaddr]
+           port:
+               Destination port [default: self.port]
+        """
+        if self.nfsversion < 4.1:
+            return
+        self.sessionid = None
+        clientid = kwargs.pop('clientid', None)
+        if clientid is not None:
+            # Get the session id tied to the client id from the cache
+            self.sessionid = self.sessionid_map.get(clientid)
+            kwargs["match"] = "NFS.clientid == %d" % clientid
+        # Find the CREATE_SESSION packets for the exchange id if given
+        self.find_nfs_op(OP_CREATE_SESSION, **kwargs)
+        if self.pktreply:
+            # Save the session id from the reply
+            self.sessionid = self.pktreply.NFSop.sessionid
+            self.sessionid_map[clientid] = self.sessionid
+        return self.sessionid
+
+    def get_rootfh(self, **kwargs):
+        """Return the root file handle from PUTROOTFH
+
+           sessionid:
+               Search the PUTROOTFH tied to this session id [default: None]
+           ipaddr:
+               Destination IP address [default: self.server_ipaddr]
+           port:
+               Destination port [default: self.port]
+        """
+        self.rootfh = None
+        sessionid = kwargs.pop('sessionid', None)
+        if sessionid is not None:
+            fh = self.rootfh_map.get(sessionid)
+            if fh is not None:
+                # Return root fh found in the cache
+                self.rootfh = fh
+                return fh
+            kwargs["match"] = "str(NFS.sessionid) == '%s'" % sessionid
+        # Find the PUTROOTFH packets for the session id if given
+        self.find_nfs_op(OP_PUTROOTFH, **kwargs)
+        if self.pktreply:
+            # Get the GETFH object from the packet
+            getfh = self.getop(self.pktreply, OP_GETFH)
+            if getfh:
+                self.rootfh = getfh.fh
+                return getfh.fh
+
+    def get_pathfh(self, path, dirfh=None):
+        """Return the file handle for the given path by searching the packet
+           trace for every component in the path.
+           The file handle for each component is used to search for the file
+           handle in the next component.
+
+           path:
+               File system path
+           dirfh:
+               Directory file handle to start with [default: None]
+        """
+        self.pktcall  = None
+        self.pktreply = None
+        # Break path into its directory components
+        path_list = split_path(path)
+        while len(path_list):
+            # Get next path component
+            name = path_list.pop(0)
+            if dirfh is None:
+                dirmatch = ""
+            else:
+                dirmatch = "crc32(nfs.fh) == %d and " % crc32(dirfh)
+            # Match any operation with a name attribute,
+            # e.g., LOOKUP, CREATE, etc.
+            mstr = "%snfs.name == '%s'" % (dirmatch, name)
+            while self.pktt.match(mstr, rewind=False, reply=True):
+                pkt = self.pktt.pkt
+                if pkt.rpc.type == 0:
+                    # Save packet call
+                    self.pktcall = pkt
+                else:
+                    # Save packet reply
+                    self.pktreply = pkt
+                    if hasattr(pkt.nfs, "status") and pkt.nfs.status == 0:
+                        # Get GETFH from the packet reply where name was matched
+                        getfh = self.getop(pkt, OP_GETFH)
+                        if getfh:
+                            # Set file handle for next iteration
+                            dirfh = getfh.fh
+                            break
+            if self.pktt.pkt is None:
+                # The name was not matched, so return None
+                return
+        return dirfh
 
     def stid_str(self, stateid):
         """Display the state id in CRC16 format"""

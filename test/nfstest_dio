@@ -25,7 +25,7 @@ from nfstest.test_util import TestUtil
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.1"
+__version__   = "1.3"
 
 USAGE = """%prog --server <server> [options]
 
@@ -481,6 +481,7 @@ class DioTest(TestUtil):
 
         try:
             self.trace_open()
+            self.set_pktlist()
             (filehandle, open_stateid, deleg_stateid) = self.find_open(filename=filename)
             stateid = deleg_stateid if deleg_stateid else open_stateid
             pkt = self.pktt.match("NFS.argop == %d and NFS.stateid.other == '%s'" % (OP_READ, self.pktt.escape(stateid)))
@@ -704,9 +705,9 @@ class DioTest(TestUtil):
 
         try:
             self.trace_open()
-
+            self.set_pktlist()
             (filehandle, open_stateid, deleg_stateid) = self.find_open(filename=file)
-            save_index = self.pktt.index
+            save_index = self.pktt.get_index()
             if deleg_stateid != None:
                 self.dprint('DBG3', "Delegation is granted")
             stateid = deleg_stateid if deleg_stateid else open_stateid
@@ -720,13 +721,13 @@ class DioTest(TestUtil):
             io_h = {}
             err_h = {}
             while self.pktt.match("NFS.argop == %d and NFS.stateid.other == '%s'" % (io_op, self.pktt.escape(stateid))):
-                save_index = self.pktt.index
+                save_index = self.pktt.get_index()
                 pkt     = self.pktt.pkt
                 roffset = pkt.NFSop.offset
                 ipaddr  = pkt.ip.dst
                 port    = pkt.tcp.dst_port
                 xid     = pkt.rpc.xid
-                pktr    = self.pktt.match("RPC.type and RPC.xid == %d" % xid)
+                pktr    = self.pktt.match("RPC.type == 1 and RPC.xid == %d" % xid)
                 self.pktt.rewind(save_index)
                 if xids.get(xid, None) is None:
                     # Save xid to keep track of re-transmitted packets
@@ -741,10 +742,9 @@ class DioTest(TestUtil):
                         err_h[errstr] = 1
                     else:
                         err_h[errstr] += 1
-                if write:
-                    rsize = len(pkt.NFSop.data)
-                else:
-                    rsize = pkt.NFSop.count
+
+                # Get size of I/O data
+                rsize = pkt.NFSop.count
 
                 if io_h.get(roffset) == rsize:
                     # This (offset, size) has already been processed
@@ -766,9 +766,10 @@ class DioTest(TestUtil):
                             dsidx = 0
                             ds_index = None
                             for ds in self.dslist:
-                                if ipaddr == ds['ipaddr'] and port == ds['port']:
-                                    ds_index = dsidx
-                                    break
+                                for item in ds:
+                                    if ipaddr == item['ipaddr'] and port == item['port']:
+                                        ds_index = dsidx
+                                        break
                                 dsidx += 1
                             out = self.verify_stripe(toffset, tsize, ds_index)
                             # XXX FIXME check ds_index
@@ -804,10 +805,7 @@ class DioTest(TestUtil):
                     else:
                         # Skip re-transmitted packets
                         continue
-                    if buffered_write:
-                        rsize = len(self.pktt.pkt.NFSop.data)
-                    else:
-                        rsize = self.pktt.pkt.NFSop.count
+                    rsize = self.pktt.pkt.NFSop.count
                     if rsize != bsize:
                         rmatch = False
                     total_size += rsize
@@ -1027,16 +1025,16 @@ class DioTest(TestUtil):
             if fd:
                 self.dprint('DBG3', "Close file %s " % absfile)
                 posix.close(fd)
-            time.sleep(1)
             self.trace_stop()
 
         try:
             fd = None
             self.trace_open()
+            self.set_pktlist()
             (filehandle, open_stateid, deleg_stateid) = self.find_open(filename=file, claimfh=self.file_handles[write], anyclaim=True)
             if filehandle:
                 self.file_handles[write] = filehandle
-                save_index = self.pktt.index
+                save_index = self.pktt.get_index()
                 self.stateid = deleg_stateid if deleg_stateid else open_stateid
                 (layoutget, layoutget_res, loc_body) = self.find_layoutget(filehandle)
                 self.layout = loc_body
@@ -1047,9 +1045,10 @@ class DioTest(TestUtil):
 
             dsismds = False
             for ds in self.dslist:
-                if self.server_ipaddr == ds['ipaddr'] and self.port == ds['port']:
-                    dsismds = True
-                    break
+                for item in ds:
+                    if self.server_ipaddr == item['ipaddr'] and self.port == item['port']:
+                        dsismds = True
+                        break
             xids = {}
             ret = []
             received = []
@@ -1064,10 +1063,7 @@ class DioTest(TestUtil):
                 else:
                     # Skip re-transmitted packets
                     continue
-                if write:
-                    rsize = len(self.pktt.pkt.NFSop.data)
-                else:
-                    rsize = self.pktt.pkt.NFSop.count
+                rsize = self.pktt.pkt.NFSop.count
                 if self.ispnfs:
                     rserver = MDS if (ipaddr == self.server_ipaddr and port == self.port) else DS
                 else:
@@ -1542,6 +1538,7 @@ try:
     x.setup(nfiles = 2)
     x.trace_stop()
     x.trace_open()
+    x.set_pktlist()
     (filehandle, open_stateid, deleg_stateid) = x.find_open(filename=x.files[0])
     (layoutget, layoutget_res, loc_body) = x.find_layoutget(filehandle)
     x.find_getdeviceinfo()
@@ -1572,6 +1569,7 @@ try:
     x.umount()
     x.trace_stop()
     x.trace_open()
+    x.set_pktlist()
     (filehandle, open_stateid, deleg_stateid) = x.find_open(filename=x.files[1])
     x.read_deleg = False if deleg_stateid is None else True
     x.pktt.rewind()

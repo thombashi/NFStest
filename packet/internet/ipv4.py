@@ -19,14 +19,15 @@ Decode IP version 4 layer.
 import struct
 import nfstest_config as c
 from baseobj import BaseObj
+from packet.utils import ShortHex
 from packet.transport.tcp import TCP
 from packet.transport.udp import UDP
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = '1.0.5'
+__version__   = "1.1"
 
 # Name of different protocols
 _IP_map = {1:'ICMP(1)', 2:'IGMP(2)', 6:'TCP(6)', 17:'UDP(17)'}
@@ -97,12 +98,12 @@ class IPv4(BaseObj):
         self.DSCP            = (ulist[1] >> 2)
         self.ECN             = (ulist[1] & 0x03)
         self.total_size      = ulist[2]
-        self.id              = ulist[3]
+        self.id              = ShortHex(ulist[3])
         self.flags           = Flags(ulist[4])
         self.fragment_offset = (ulist[4] & 0x1FFF)
         self.TTL             = ulist[5]
         self.protocol        = ulist[6]
-        self.checksum        = ulist[7]
+        self.checksum        = ShortHex(ulist[7])
         self.src             = "%d.%d.%d.%d" % ulist[8:12]
         self.dst             = "%d.%d.%d.%d" % ulist[12:]
 

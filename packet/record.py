@@ -23,10 +23,14 @@ import nfstest_config as c
 from baseobj import BaseObj
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
-__version__   = '1.0.3'
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
+__version__   = "2.1"
+
+FRAME  = 0
+INDEX  = 1
+TSTAMP = 1
 
 class Record(BaseObj):
     """Record object
@@ -39,7 +43,8 @@ class Record(BaseObj):
        Object definition:
 
        Record(
-           index       = int,   # Frame number
+           frame       = int,   # Frame number
+           index       = int,   # Packet number
            seconds     = int,   # Seconds
            usecs       = int,   # Microseconds
            length_inc  = int,   # Number of bytes included in trace
@@ -49,8 +54,8 @@ class Record(BaseObj):
        )
     """
     # Class attributes
-    _attrlist = ("index", "seconds", "usecs", "length_inc", "length_orig",
-                 "secs", "rsecs")
+    _attrlist = ("frame", "index", "seconds", "usecs",
+                 "length_inc", "length_orig", "secs", "rsecs")
 
     def __init__(self, pktt, data):
         """Constructor
@@ -65,6 +70,7 @@ class Record(BaseObj):
         """
         # Decode record header
         ulist = struct.unpack(pktt.header_rec, data)
+        self.frame       = pktt.frame
         self.index       = pktt.index
         self.seconds     = ulist[0]
         self.usecs       = ulist[1]
@@ -86,7 +92,7 @@ class Record(BaseObj):
            The representation depends on the verbose level set by debug_repr().
            If set to 0 the generic object representation is returned.
            If set to 1 the representation of the object is condensed to display
-           the frame number and the timestamp:
+           either or both the frame or packet numbers and the timestamp:
                '57 2014-03-16 13:42:56.530957 '
 
            If set to 2 the representation of the object also includes the number
@@ -94,13 +100,27 @@ class Record(BaseObj):
            verbose:
                'frame 57 @ 2014-03-16 13:42:56.530957, 42 bytes on wire, 42 packet bytes'
         """
+        idxstr = ""
+        tstamp = ""
         rdebug = self.debug_repr()
-        if rdebug in [1,2]:
+        if TSTAMP and rdebug in [1,2]:
             tstamp = "%s.%06d" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.seconds)), self.usecs)
         if rdebug == 1:
-            out = "%d %s " % (self.index, tstamp)
+            if FRAME and INDEX:
+                idxstr = "%d,%d " % (self.frame, self.index)
+            elif FRAME:
+                idxstr = "%d " % self.frame
+            elif INDEX:
+                idxstr = "%d " % self.index
+            out = "%s%s " % (idxstr, tstamp)
         elif rdebug == 2:
-            out = "frame %d @ %s, %d bytes on wire, %d packet bytes" % (self.index, tstamp, self.length_inc, self.length_orig)
+            if FRAME and INDEX:
+                idxstr = "frame %d,%d @ " % (self.frame, self.index)
+            elif FRAME:
+                idxstr = "frame %d @ " % self.frame
+            elif INDEX:
+                idxstr = "index %d @ " % self.index
+            out = "%s%s, %d bytes on wire, %d packet bytes" % (idxstr, tstamp, self.length_inc, self.length_orig)
         else:
             out = BaseObj.__str__(self)
         return out

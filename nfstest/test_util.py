@@ -52,6 +52,8 @@ import struct
 import inspect
 import textwrap
 from utils import *
+from formatstr import *
+from rexec import Rexec
 import nfstest_config as c
 from baseobj import BaseObj
 from nfs_util import NFSUtil
@@ -61,7 +63,7 @@ from optparse import OptionParser, OptionGroup, IndentedHelpFormatter
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.2"
+__version__   = "1.6"
 
 # Constants
 PASS = 0
@@ -74,7 +76,8 @@ IGNR = -4
 
 VT_NORM = "\033[m"
 VT_BOLD = "\033[1m"
-VT_UL   = "\033[4m"
+VT_BLUE = "\033[34m"
+VT_HL   = "\033[47m"
 
 _isatty = os.isatty(1)
 
@@ -92,8 +95,8 @@ _test_map = {
 _test_map_c = {
     HEAD: "\n*** ",
     INFO: "    ",
-    PASS: "    \033[32mPASS\033[m: ",
-    FAIL: "    \033[31mFAIL\033[m: ",
+    PASS: "    \033[102mPASS\033[m: ",
+    FAIL: "    \033[41m\033[37mFAIL\033[m: ",
     WARN: "    \033[33mWARN\033[m: ",
     BUG:  "    \033[33mBUG\033[m:  ",
     IGNR: "    \033[33mIGNR\033[m: ",
@@ -188,7 +191,11 @@ class TestUtil(NFSUtil):
         self.ignore = False
         self.bugmsgs = None
         self.nocleanup = True
+        self.isatty = _isatty
         self.test_time = [time.time()]
+        self._disp_time = 0
+        self._disp_msgs = 0
+        self._empty_msg = 0
         self._fileopt = True
         self.remove_list = []
         self.fileidx = 1
@@ -196,7 +203,6 @@ class TestUtil(NFSUtil):
         self.logidx = 1
         self.files = []
         self.dirs = []
-        self.abshash = {}
         self.test_msgs = []
         self._msg_count = {}
         self._reset_files()
@@ -205,6 +211,11 @@ class TestUtil(NFSUtil):
         self._opts_done = False
         # List of sparse files
         self.sparse_files = []
+        # Rexec attributes
+        self.rexecobj = None
+        self.rexecobj_list = []
+        # List of remote files
+        self.remote_files = []
 
         for tid in _test_map:
             self._msg_count[tid] = 0
@@ -227,27 +238,34 @@ class TestUtil(NFSUtil):
         """
         self.debug_repr(0)
         self._tverbose()
-        self._print_msg("")
+        self._print_msg("", single=1)
+        count = self.dprint_count()
         self.dprint('DBG7', "Calling %s() destructor" % self.__class__.__name__)
         self.trace_stop()
-        self.cleanup()
+        self.cleanup(newline=False)
         # Call base destructor
         NFSUtil.__del__(self)
+        if self.dprint_count() > count:
+            self._empty_msg = 0
 
         if len(self.test_msgs) > 0:
             if getattr(self, 'logfile', None):
-                print "\nLogfile: %s" % self.logfile
+                if not self._empty_msg:
+                    print ""
+                print "Logfile: %s" % self.logfile
+                self._empty_msg = 0
             ntests, tmsg = self._total_counts(self._msg_count)
             if ntests > 0:
+                self._print_msg("", single=1)
                 msg = "%d tests%s" % (ntests, tmsg)
-                self.write_log("\n" + msg)
+                self.write_log(msg)
                 if self._msg_count[FAIL] > 0:
-                    msg = "\033[31m" + msg + "\033[m" if _isatty else msg
+                    msg = "\033[31m" + msg + "\033[m" if self.isatty else msg
                 elif self._msg_count[WARN] > 0:
-                    msg = "\033[33m" + msg + "\033[m" if _isatty else msg
+                    msg = "\033[33m" + msg + "\033[m" if self.isatty else msg
                 else:
-                    msg = "\033[32m" + msg + "\033[m" if _isatty else msg
-                print "\n" + msg
+                    msg = "\033[32m" + msg + "\033[m" if self.isatty else msg
+                print msg
         if self._opts_done:
             self.total_time = time.time() - self.test_time[0]
             total_str = "\nTotal time: %s" % self._print_time(self.total_time)
@@ -306,7 +324,7 @@ class TestUtil(NFSUtil):
 
     def _init_options(self):
         """Initialize command line options parsing and definitions."""
-        self.opts = OptionParser("%prog [options]", formatter = IndentedHelpFormatter(2, 25), version = "%prog " + __version__)
+        self.opts = OptionParser("%prog [options]", formatter = IndentedHelpFormatter(2, 10), version = "%prog " + __version__)
         hmsg = "File where options are specified besides the system wide " + \
                "file /etc/nfstest, user wide file $HOME/.nfstest or in " + \
                "the current directory .nfstest file"
@@ -341,17 +359,21 @@ class TestUtil(NFSUtil):
         self.log_opgroup.add_option("--tverbose", default=_rtverbose_map[self.tverbose], help=hmsg)
         hmsg = "Create log file"
         self.log_opgroup.add_option("--createlog", action="store_true", default=False, help=hmsg)
+        hmsg = "Create rexec log files"
+        self.log_opgroup.add_option("--rexeclog", action="store_true", default=False, help=hmsg)
         hmsg = "Display warnings"
         self.log_opgroup.add_option("--warnings", action="store_true", default=False, help=hmsg)
         hmsg = "Informational tag, it is displayed as an INFO message [default: '%default']"
         self.log_opgroup.add_option("--tag", default="", help=hmsg)
+        hmsg = "Do not use terminal colors on output"
+        self.log_opgroup.add_option("--notty", action="store_true", default=False, help=hmsg)
         self.opts.add_option_group(self.log_opgroup)
 
         self.cap_opgroup = OptionGroup(self.opts, "Packet trace options")
         hmsg = "Create a packet trace for each test"
         self.cap_opgroup.add_option("--createtraces", action="store_true", default=False, help=hmsg)
-        hmsg = "Capture buffer size for tcpdump [default: '%default']"
-        self.cap_opgroup.add_option("--tbsize", type="int", default=self.tbsize, help=hmsg)
+        hmsg = "Capture buffer size for tcpdump [default: %default]"
+        self.cap_opgroup.add_option("--tbsize", default="192k", help=hmsg)
         hmsg = "Seconds to delay before stopping packet trace [default: %default]"
         self.cap_opgroup.add_option("--trcdelay", type="float", default=0.0, help=hmsg)
         hmsg = "Do not remove any trace files [default: remove trace files if no errors]"
@@ -366,15 +388,15 @@ class TestUtil(NFSUtil):
         hmsg = "Number of files to create [default: %default]"
         self.file_opgroup.add_option("--nfiles", type="int", default=2, help=hmsg)
         hmsg = "File size to use for test files [default: %default]"
-        self.file_opgroup.add_option("--filesize", type="int", default=65536, help=hmsg)
+        self.file_opgroup.add_option("--filesize", default="64k", help=hmsg)
         hmsg = "Read size to use when reading files [default: %default]"
-        self.file_opgroup.add_option("--rsize", type="int", default=4096, help=hmsg)
+        self.file_opgroup.add_option("--rsize", default="4k", help=hmsg)
         hmsg = "Write size to use when writing files [default: %default]"
-        self.file_opgroup.add_option("--wsize", type="int", default=4096, help=hmsg)
+        self.file_opgroup.add_option("--wsize", default="4k", help=hmsg)
         hmsg = "Seconds to delay I/O operations [default: %default]"
         self.file_opgroup.add_option("--iodelay", type="float", default=0.1, help=hmsg)
         hmsg = "Read/Write offset delta [default: %default]"
-        self.file_opgroup.add_option("--offset-delta", type="int", default=4096, help=hmsg)
+        self.file_opgroup.add_option("--offset-delta", default="4k", help=hmsg)
         self.opts.add_option_group(self.file_opgroup)
 
         self.path_opgroup = OptionGroup(self.opts, "Path options")
@@ -405,6 +427,8 @@ class TestUtil(NFSUtil):
         self.dbg_opgroup.add_option("--nfsdebug", default=self.nfsdebug, help=hmsg)
         hmsg = "Set RPC kernel debug flags and save log messages [default: '%default']"
         self.dbg_opgroup.add_option("--rpcdebug", default=self.rpcdebug, help=hmsg)
+        hmsg = "Display main packets related to the given test"
+        self.dbg_opgroup.add_option("--pktdisp", action="store_true", default=False, help=hmsg)
         self.opts.add_option_group(self.dbg_opgroup)
 
         usage = self.usage
@@ -577,7 +601,7 @@ class TestUtil(NFSUtil):
                                 idblock = name
                             elif idblock == self.sid:
                                 # Open a testblock only if testblock is located
-                                # inside an idblock correspondig to script ID
+                                # inside an idblock corresponding to script ID
                                 testblock = name
                                 if self.testopts.get(name) is None:
                                     # Initialize testblock only if it has not
@@ -619,6 +643,10 @@ class TestUtil(NFSUtil):
             # --file option
             self.scan_options()
         else:
+            if opts.notty:
+                # Do not use terminal colors
+                self.isatty = False
+
             try:
                 # Set verbose level mask
                 self.debug_level(opts.verbose)
@@ -676,6 +704,13 @@ class TestUtil(NFSUtil):
             self.tverbose = _tverbose_map.get(self.tverbose)
             if self.tverbose is None:
                 self.opts.error("invalid value for tverbose option")
+
+            # Convert units
+            self.filesize     = int_units(self.filesize)
+            self.rsize        = int_units(self.rsize)
+            self.wsize        = int_units(self.wsize)
+            self.offset_delta = int_units(self.offset_delta)
+            self.tbsize       = int_units(self.tbsize)
 
             if len(self.basename) > 0:
                 self._name      = self.basename
@@ -764,7 +799,7 @@ class TestUtil(NFSUtil):
             self.umount()
         self.dprint('DBG7', "SETUP done")
 
-    def cleanup(self):
+    def cleanup(self, newline=True):
         """Clean up test environment.
 
            Remove any files created: test files, trace files.
@@ -775,7 +810,40 @@ class TestUtil(NFSUtil):
         # Cleanup just once
         self.nocleanup = True
 
+        if newline:
+            self._tverbose()
+            self._print_msg("", single=1)
         self.dprint('DBG7', "CLEANUP starts")
+        if not self.mounted and self.remove_list:
+            self.mount()
+
+        for rexecobj in self.rexecobj_list:
+            try:
+                if rexecobj.remote:
+                    srvname = "at %s" % rexecobj.servername
+                else:
+                    srvname = "locally"
+                self.dprint('DBG3', "    Stop remote procedure server %s" % srvname)
+                rexecobj.close()
+            except:
+                pass
+        self.rexecobj = None
+        self.rexecobj_list = []
+
+        for item in self.remote_files:
+            try:
+                cmd = "scp %s:%s %s" % (item[0], item[1], self.tmpdir)
+                self.run_cmd(cmd, dlevel='DBG4', msg="    Copy remote file: ")
+            except Exception as e:
+                self.dprint('DBG7', "    ERROR: %s" % e)
+
+        for item in self.remote_files:
+            try:
+                cmd = "ssh -t %s sudo rm -f %s" % (item[0], item[1])
+                self.run_cmd(cmd, dlevel='DBG4', msg="    Removing remote file: ")
+            except:
+                pass
+
         if not self.keeptraces and (self.rmtraces or self._msg_count[FAIL] == 0):
             for rfile in self.tracefiles:
                 try:
@@ -785,8 +853,6 @@ class TestUtil(NFSUtil):
                 except:
                     pass
 
-        if not self.mounted and self.remove_list:
-            self.mount()
         for rfile in reversed(self.remove_list):
             try:
                 if os.path.exists(rfile):
@@ -807,6 +873,26 @@ class TestUtil(NFSUtil):
         self.umount()
         self.dprint('DBG7', "CLEANUP done")
 
+    def create_rexec(self, servername=None, **kwds):
+        """Create remote server object."""
+        if self.rexeclog:
+            kwds["logfile"] = kwds.get("logfile", self.get_logname())
+        else:
+            kwds["logfile"] = None
+
+        # Start remote procedure server on given client
+        if servername in [None, "", "localhost", "127.0.0.1"]:
+            svrname = "locally"
+        else:
+            svrname = "at %s" % servername
+            if kwds.get("logfile") is not None:
+                self.remote_files.append([servername, kwds["logfile"]])
+
+        self.dprint('DBG2', "Start remote procedure server %s" % svrname)
+        self.rexecobj = Rexec(servername, **kwds)
+        self.rexecobj_list.append(self.rexecobj)
+        return self.rexecobj
+
     def run_tests(self, **kwargs):
         """Run all test specified by the --runtest option.
 
@@ -826,20 +912,30 @@ class TestUtil(NFSUtil):
                 # Execute test
                 getattr(self, testmethod)(**kwargs)
 
-    def _print_msg(self, msg, tid=None):
+    def _print_msg(self, msg, tid=None, single=0):
         """Display message to the screen and to the log file."""
+        if single and self._empty_msg:
+            # Display only a single empty line
+            return
         tidmsg_l = '' if tid is None else _test_map[tid]
         self.write_log(tidmsg_l + msg)
-        if _isatty:
+        if self.isatty:
             tidmsg_s = _test_map_c.get(tid, tidmsg_l)
             if tid == HEAD:
-                msg = VT_UL + VT_BOLD + msg + VT_NORM
+                msg = VT_HL + VT_BOLD + msg + VT_NORM
             elif tid == INFO:
+                msg = VT_BLUE + VT_BOLD + msg + VT_NORM
+            elif tid in [PASS, FAIL]:
                 msg = VT_BOLD + msg + VT_NORM
         else:
             tidmsg_s = tidmsg_l
         print tidmsg_s + msg
         sys.stdout.flush()
+        if len(msg) > 0:
+            self._empty_msg = 0
+            self._disp_msgs += 1
+        else:
+            self._empty_msg = 1
 
     def _print_time(self, sec):
         """Return the given time in the format [[%dh]%dm]%fs."""
@@ -878,6 +974,10 @@ class TestUtil(NFSUtil):
             for tid in _test_map:
                 gcounts[tid] = 0
             for item in self.test_msgs[-1]:
+                if item[3]:
+                    # This message has already been displayed
+                    continue
+                item[3] = 1
                 if len(item[2]) > 0:
                     # Include all subtest results on the counts
                     for subitem in item[2]:
@@ -886,26 +986,31 @@ class TestUtil(NFSUtil):
                     # No subtests, include just the test results
                     gcounts[item[0]] += 1
             (total, tmsg) = self._total_counts(gcounts)
-            # Fail the current test group if at least one of the tests within
-            # this group fails
-            tid = FAIL if gcounts[FAIL] > 0 else PASS
-            # Just add the test group as a single test entity in the total count
-            self._msg_count[tid] += 1
-            # Just display the test group message with the count of tests
-            # that passed and failed within this test group
-            msg = self.test_msgs[-1][0][1].replace("\n", "\n          ")
-            self._print_msg(msg + tmsg, tid)
-            sys.stdout.flush()
+            if total > 1:
+                # Fail the current test group if at least one of the tests within
+                # this group fails
+                tid = FAIL if gcounts[FAIL] > 0 else PASS
+                # Just add the test group as a single test entity in the total count
+                self._msg_count[tid] += 1
+                # Just display the test group message with the count of tests
+                # that passed and failed within this test group
+                msg = self.test_msgs[-1][0][1].replace("\n", "\n          ")
+                self._print_msg(msg + tmsg, tid)
+                sys.stdout.flush()
         elif self.tverbose == 1 and len(self.test_msgs) > 0:
             # Process all sub-groups within the current test group
             group = self.test_msgs[-1]
-            for subroup in group:
-                sgtid = subroup[0]
-                msg = subroup[1]
-                subtests = subroup[2]
-                if len(subtests) == 0:
+            for subgroup in group:
+                sgtid = subgroup[0]
+                msg = subgroup[1]
+                subtests = subgroup[2]
+                disp = subgroup[3]
+                if len(subtests) == 0 or disp:
                     # Nothing to process, there are no subtests
+                    # or have already been displayed
                     continue
+                # Do not display message again
+                subgroup[3] = 1
                 # Get the count for each type of message within this
                 # test sub-group
                 gcounts = {}
@@ -945,7 +1050,7 @@ class TestUtil(NFSUtil):
             # Sub-group not found, add it
             # [tid, test-message, list-of-subtest-results]
             grpid = len(group)
-            group.append([tid, subgroup, []])
+            group.append([tid, subgroup, [], 0])
         return grpid
 
     def _test_msg(self, tid, msg, subtest=None, failmsg=None):
@@ -988,10 +1093,13 @@ class TestUtil(NFSUtil):
         """Add an INFO message having the time difference between the current
            time and the time of the last call to this method.
         """
+        if self._disp_time >= self._disp_msgs + self.dprint_count():
+            return
         self.test_time.append(time.time())
         if self._opts_done and len(self.test_time) > 1:
             ttime = self.test_time[-1] - self.test_time[-2]
             self._test_msg(INFO, "TIME: %s" % self._print_time(ttime))
+        self._disp_time = self._disp_msgs + self.dprint_count()
 
     def exit(self):
         """Terminate script with an exit value of 0 when all tests passed
@@ -1079,18 +1187,10 @@ class TestUtil(NFSUtil):
         """Return the number of instances the testid has occurred."""
         return self._msg_count[tid]
 
-    def abspath(self, filename, dir=None):
-        """Return the absolute path for the given file name."""
-        path = self.abshash.get(filename)
-        if path is None:
-            bdir = "" if dir is None else "%s/" % dir
-            path = "%s/%s%s" % (self.mtdir, bdir, filename)
-        return path
-
     def get_name(self):
         """Get unique name for this instance."""
         if not self._name:
-            timestr = self.timestamp("{0:date:%Y%m%d%H%M%S_%q}")
+            timestr = self.timestamp("{0:date:%Y%m%d%H%M%S}")
             self._name = "%s_%s" % (self.progname, timestr)
         return self._name
 
@@ -1099,7 +1199,6 @@ class TestUtil(NFSUtil):
         self.dirname = "%s_d_%d" % (self.get_name(), self.diridx)
         self.diridx += 1
         self.absdir = self.abspath(self.dirname, dir=dir)
-        self.abshash[self.dirname] = self.absdir
         self.dirs.append(self.dirname)
         self.remove_list.append(self.absdir)
         return self.dirname
@@ -1109,7 +1208,6 @@ class TestUtil(NFSUtil):
         self.filename = "%s_f_%d" % (self.get_name(), self.fileidx)
         self.fileidx += 1
         self.absfile = self.abspath(self.filename, dir=dir)
-        self.abshash[self.filename] = self.absfile
         self.files.append(self.filename)
         self.remove_list.append(self.absfile)
         return self.filename

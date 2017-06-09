@@ -36,13 +36,20 @@ import nfstest_config as c
 from baseobj import BaseObj
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = '1.0.2'
+__version__   = "1.1"
 
 # The order in which to display all layers in the packet
-PKT_layers = ['record', 'ethernet', 'ip', 'tcp', 'udp', 'rpc', 'gssd', 'nfs', 'mount', 'portmap', 'nlm', 'gssc']
+PKT_layers = [
+    'record',
+    'ethernet',
+    'ip', 'arp', 'rarp',
+    'tcp', 'udp',
+    'rpc', 'ntp', 'dns', 'krb',
+    'gssd', 'nfs', 'mount', 'portmap', 'nlm', 'gssc',
+]
 # Required layers for debug_repr(1)
 _PKT_rlayers = ['record', 'ip']
 # Do not display these layers for debug_repr(1)
@@ -112,7 +119,7 @@ class Pkt(BaseObj):
             lastkey = len(klist) - 1
             for key in klist:
                 value = getattr(self, key, None)
-                if value is not None and (rdebug > 1 or index == lastkey or key in _PKT_rlayers):
+                if value is not None and (rdebug > 1 or index == lastkey or key in _PKT_rlayers or (self != "ip" and key == "ethernet")):
                     if rdebug == 1:
                         if index == lastkey and key in _PKT_mlayers:
                             # Display level 2 if last layer is in _PKT_mlayers
@@ -124,6 +131,9 @@ class Pkt(BaseObj):
                     else:
                         sps = " " * (_maxlen - len(key))
                         out += "    %s:%s %s\n" % (key.upper(), sps, str(value))
+                        if index == lastkey and hasattr(value, "data") and value.data is not None and key != "nfs":
+                            sps = " " * (_maxlen - 4)
+                            out += "    DATA:%s 0x%s\n" % (sps, value.data.encode("hex"))
                 index += 1
             out += ")\n" if rdebug == 2 else ""
         else:

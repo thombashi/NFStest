@@ -18,13 +18,17 @@ Decode UDP layer.
 """
 import nfstest_config as c
 from baseobj import BaseObj
+from packet.utils import ShortHex
+from packet.application.dns import DNS
 from packet.application.rpc import RPC
+from packet.application.ntp4 import NTP
+from packet.application.krb5 import KRB5
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2014 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = '1.0'
+__version__   = "1.1"
 
 class UDP(BaseObj):
     """UDP object
@@ -47,7 +51,7 @@ class UDP(BaseObj):
     # Class attributes
     _attrlist = ("src_port", "dst_port", "length", "checksum", "data")
     _strfmt1  = "UDP {0} -> {1}, len: {2}"
-    _strfmt2  = "src port {0} -> dst port {1}, len: {2}, checksum: {3:#010x}"
+    _strfmt2  = "src port {0} -> dst port {1}, len: {2}, checksum: {3}"
 
     def __init__(self, pktt):
         """Constructor
@@ -65,13 +69,32 @@ class UDP(BaseObj):
         self.src_port = ulist[0]
         self.dst_port = ulist[1]
         self.length   = ulist[2]
-        self.checksum = ulist[3]
+        self.checksum = ShortHex(ulist[3])
 
         pktt.pkt.udp = self
         self._decode_payload(pktt)
 
     def _decode_payload(self, pktt):
         """Decode UDP payload."""
+        if 123 in [self.src_port, self.dst_port]:
+            # NTP on port 123
+            ntp = NTP(pktt)
+            if ntp:
+                pktt.pkt.ntp = ntp
+            return
+        elif 53 in [self.src_port, self.dst_port]:
+            # DNS on port 53
+            dns = DNS(pktt, proto=17)
+            if dns:
+                pktt.pkt.dns = dns
+            return
+        elif 88 in [self.src_port, self.dst_port]:
+            # KRB5 on port 88
+            krb = KRB5(pktt, proto=17)
+            if krb:
+                pktt.pkt.krb = krb
+            return
+
         # Get RPC header
         rpc = RPC(pktt, proto=17)
 

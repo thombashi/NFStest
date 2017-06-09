@@ -25,7 +25,7 @@ from nfstest.test_util import TestUtil
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.0.3"
+__version__   = "1.4"
 
 USAGE = """%prog --server <server> [options]
 
@@ -177,7 +177,7 @@ class pNFSTest(TestUtil):
                restricted by this [default: None]
         """
         # Save current packet index
-        save_index = self.pktt.index
+        save_index = self.pktt.get_index()
         self.writeverf        = None
         self.need_commit      = False
         self.need_lcommit     = False
@@ -193,10 +193,10 @@ class pNFSTest(TestUtil):
         self.test_commit_full = True
         self.test_commit_verf = True
         self.test_no_commit   = False
-        self.dsio_list = []
-        self.stateid = None
-        test_pattern = True
+        self.stateid          = None
+        test_pattern          = True
         io_str = 'READ' if iomode == LAYOUTIOMODE4_READ else 'WRITE'
+        io_op = OP_READ if iomode == LAYOUTIOMODE4_READ else OP_WRITE
         layout_dense = 'dense' if self.layout['dense'] else 'sparse'
         filehandle = openfh['filehandle']
 
@@ -205,8 +205,7 @@ class pNFSTest(TestUtil):
 
         # Get number of DS's in layout
         nds = 0
-        for ds_list in multipath_ds_list:
-            nds += len(ds_list)
+        nds = len(multipath_ds_list)
 
         # Check if file size is big enough to send traffic to all DS's
         self.dprint('DBG2', "Number of DataServers %d" % nds)
@@ -235,33 +234,45 @@ class pNFSTest(TestUtil):
                 index += 1
 
         ds_index = 0
+        dsio_list = []
         for ds_list in multipath_ds_list:
+            ds_traffic = False
+            dsio_list.append(0)
             for item in ds_list:
                 if not self.layout['commit_mds']:
                     self.writeverf = None
 
                 # Get ip address and port for DS
-                addr_list = item.addr.split('.')
-                ipaddr = '.'.join(addr_list[:4])
-                port = (int(addr_list[4])<<8) + int(addr_list[5])
+                ipaddr, port = self.get_addr_port(item.addr)
                 self.dprint('DBG2', "DataServer(%d) ipaddr: %s, port: %d" % (ds_index, ipaddr, port))
-                self.dsismds = ipaddr == self.server_ipaddr
 
                 # Rewind trace file to saved packet index
                 self.pktt.rewind(save_index)
 
                 if nocreate_list:
+                    # nocreate_list takes precedence over newgetdev
+                    newgetdev = False
                     nocreate = nocreate_list[ds_index]
+
+                if len(ds_list) > 1:
+                    # Mulipath DS, so find out if any address on given
+                    # DS has any traffic
+                    (pktcall, pktreply) = self.find_nfs_op(io_op, ipaddr=ipaddr, port=port)
+                    if pktcall:
+                        ds_traffic = True
+                        self.pktt.rewind(save_index)
+                    elif ds_traffic or item != ds_list[-1]:
+                        continue
 
                 # Verify NFSv4.1 create session to DS
                 self.verify_create_session(ipaddr, port, ds=True, nocreate=(nocreate and not newgetdev), ds_index=ds_index)
                 if self.sessionid:
-                    self.session_ids.append(self.sessionid)
+                    self.session_ids[self.sessionid] = "DS(%d)" % ds_index
 
                 # Find all I/O requests and replies for current DS
                 self.test_pattern = True
                 nio = self.verify_io(iomode, stateid, ipaddr, port, ds_index=ds_index)
-                self.dsio_list.append(nio)
+                dsio_list[ds_index] += nio
                 if len(write_list) > 0:
                     if write_list[ds_index] and not self.test_pattern:
                         test_pattern = False
@@ -274,8 +285,7 @@ class pNFSTest(TestUtil):
 
                     # Verify commits
                     self.verify_commit(ipaddr, port, self.get_filehandle(ds_index))
-
-                ds_index += 1
+            ds_index += 1
 
         if len(write_list) == 0:
             # Option is not given so expect writes to all DS's
@@ -285,7 +295,7 @@ class pNFSTest(TestUtil):
         no_write = True
         index = 0
         nio_total = 0
-        for nio in self.dsio_list:
+        for nio in dsio_list:
             if write_list[index] and nio == 0:
                 do_write = False
             elif not write_list[index] and nio > 0:
@@ -338,9 +348,7 @@ class pNFSTest(TestUtil):
                 for ds_list in multipath_ds_list:
                     for item in ds_list:
                         # Get ip address and port for DS
-                        addr_list = item.addr.split('.')
-                        ipaddr = '.'.join(addr_list[:4])
-                        port = (int(addr_list[4])<<8) + int(addr_list[5])
+                        ipaddr, port = self.get_addr_port(item.addr)
 
                         # Rewind trace file to saved packet index
                         self.pktt.rewind(save_index)
@@ -437,7 +445,7 @@ class pNFSTest(TestUtil):
         delegreturn       = kwargs.pop('delegreturn', False)
         verify_close      = kwargs.pop('verify_close', True)
 
-        self.session_ids = []
+        self.session_ids = {}
 
         if len(multipath_ds_list) == 0:
             # Clear list of device ids
@@ -447,7 +455,7 @@ class pNFSTest(TestUtil):
             # Verify NFSv4.1 create session to MDS
             self.verify_create_session(self.server_ipaddr, self.port)
             if self.sessionid:
-                self.session_ids.append(self.sessionid)
+                self.session_ids[self.sessionid] = "MDS"
 
         # Find OPEN request
         self.dprint('DBG2', "Find OPEN for file %s" % filename)
@@ -472,7 +480,7 @@ class pNFSTest(TestUtil):
 
         lock_stateid = None
         if lock:
-            (pktcall, pktreply) = self.find_nfs_op(OP_LOCK, self.server_ipaddr, self.port)
+            (pktcall, pktreply) = self.find_nfs_op(OP_LOCK)
             if deleg_stateid is None:
                 self.test(pktcall, "LOCK should be sent")
                 if pktcall:
@@ -544,7 +552,9 @@ class pNFSTest(TestUtil):
                 xid = pktcall.rpc.xid
                 self.test(pktcall.NFSop.type == LAYOUT4_NFSV4_1_FILES, "GETDEVICEINFO layout type should be LAYOUT4_NFSV4_1_FILES")
                 if getattr(self, 'ca_maxrespsz', None) is not None:
-                    self.test(pktcall.NFSop.maxcount <= self.ca_maxrespsz, "GETDEVICEINFO maxcount should be less than or equal to max_response_size in CREATE_SESSION reply")
+                    tmsg = "GETDEVICEINFO maxcount should be less than or equal to max_response_size in CREATE_SESSION reply"
+                    fmsg = " - (%d > %d)" % (pktcall.NFSop.maxcount, self.ca_maxrespsz)
+                    self.test(pktcall.NFSop.maxcount <= self.ca_maxrespsz, tmsg, failmsg=fmsg)
 
                 # Find GETDEVICEINFO reply
                 if pktreply:
@@ -584,7 +594,7 @@ class pNFSTest(TestUtil):
                     self.test(False, "GETDEVICEINFO reply was not found")
 
         # Save current packet index
-        save_index = self.pktt.index
+        save_index = self.pktt.get_index()
 
         if not nolayoutget or 'samefile' in openfh:
             self.verify_pnfs_functionality(openfh, iomode, filesize, multipath_ds_list, need_getdev, nocreate, nocreate_list, write_list, max_iosize, nmax_iosize)
@@ -598,7 +608,7 @@ class pNFSTest(TestUtil):
 
     def verify_close(self, openfh, delegreturn, noclose):
             # Save current packet index
-            save_index = self.pktt.index
+            save_index = self.pktt.get_index()
             filehandle    = openfh['filehandle']
             open_stateid  = openfh['open_stateid']
             deleg_stateid = openfh['deleg_stateid']
@@ -606,14 +616,14 @@ class pNFSTest(TestUtil):
 
             if delegreturn:
                 # Find DELEGRETURN request
-                (pktcall, pktreply) = self.find_nfs_op(OP_DELEGRETURN, self.server_ipaddr, self.port, match=fhandlestr)
+                (pktcall, pktreply) = self.find_nfs_op(OP_DELEGRETURN, match=fhandlestr)
                 if pktcall:
                     self.test(pktcall.NFSop.stateid == deleg_stateid, "DELEGRETURN should use the delegation stateid")
                 else:
                     self.test(False, "DELEGRETURN should be sent")
             elif not noclose:
                 # Find CLOSE request
-                (pktcall, pktreply) = self.find_nfs_op(OP_CLOSE, self.server_ipaddr, self.port, match=fhandlestr)
+                (pktcall, pktreply) = self.find_nfs_op(OP_CLOSE, match=fhandlestr)
                 if pktcall:
                     self.test(pktcall.NFSop.stateid == open_stateid, "CLOSE should use the open stateid")
                 else:
@@ -621,7 +631,7 @@ class pNFSTest(TestUtil):
 
                 # Find if there is a DELEGRETURN
                 self.pktt.rewind(save_index)
-                (pktcall, pktreply) = self.find_nfs_op(OP_DELEGRETURN, self.server_ipaddr, self.port, match=fhandlestr)
+                (pktcall, pktreply) = self.find_nfs_op(OP_DELEGRETURN, match=fhandlestr)
                 if pktcall:
                     # Delegation has been returned
                     self.test(pktcall.NFSop.stateid == deleg_stateid, "DELEGRETURN should use the delegation stateid")
@@ -632,37 +642,26 @@ class pNFSTest(TestUtil):
     def verify_destroy_session(self):
         """Verify DESTROY_SESSION should be sent to MDS and all DS's on umount."""
         # Find all DESTROY_SESSION requests
-        xids = []
-        save_index = self.pktt.index
+        xids = {}
         if len(self.session_ids) == 0:
             self.test(False, "No session ids to look for on DESTROY_SESSION")
             return
-        while True:
-            pkt = self.pktt.match("NFS.argop == %d" % OP_DESTROY_SESSION)
-            if not pkt:
-                break
-            sessionid = pkt.NFSop.sessionid
-            if sessionid in self.session_ids:
-                self.session_ids.remove(sessionid)
-                xids.append(pkt.rpc.xid)
-
-        self.test(len(self.session_ids) == 0, "DESTROY_SESSION should be sent to MDS and all DS's on umount")
-
-        # Rewind trace file to saved packet index
-        self.pktt.rewind(save_index)
-
-        # Find all DESTROY_SESSION replies
-        while True:
-            # Find DESTROY_SESSION reply
-            pkt = self.pktt.match("NFS.resop == %d" % OP_DESTROY_SESSION)
-            if not pkt:
-                break
-            xid = pkt.rpc.xid
-            if xid in xids:
-                xids.remove(xid)
-                if len(xids) == 0:
-                    break
-
+        while self.pktt.match("NFS.argop == %d" % OP_DESTROY_SESSION, reply=True):
+            pkt = self.pktt.pkt
+            if pkt.rpc.type == 0:
+                sessionid = pkt.NFSop.sessionid
+                server = self.session_ids.pop(sessionid, None)
+                if server is not None:
+                    xids[pkt.rpc.xid] = server
+                    self.test(True, "DESTROY_SESSION should be sent to %s on umount" % server)
+            else:
+                xid = pkt.rpc.xid
+                server = xids.pop(xid, None)
+                if server is not None:
+                    fmsg = " - failed with %s(%d)" % (pkt.nfs.status, pkt.nfs.status)
+                    self.test(pkt.nfs.status == 0, "DESTROY_SESSION should succeed for %s" % server, failmsg=fmsg)
+        for server in self.session_ids.values():
+            self.test(False, "DESTROY_SESSION should be sent to %s on umount" % server)
         if len(xids) > 0:
             self.test(False, "Could not find all replies to DESTROY_SESSION")
 
@@ -792,6 +791,7 @@ class pNFSTest(TestUtil):
             self.umount()
             self.trace_stop()
             self.trace_open()
+            self.set_pktlist()
 
             self.find_getdeviceinfo()
             self.pktt.rewind()
@@ -833,8 +833,10 @@ class pNFSTest(TestUtil):
                 filename2 = self.files[1]
                 self.read_file(filename2)
 
-            time.sleep(2)
-            trace2 = self.trace_start()
+            if swrite or write:
+                time.sleep(1)
+                trace2 = self.trace_start()
+
             if swrite:
                 self.dprint('DBG3', "Open first file again on same session [%s] writing %d@%d" % (filename, self.filesize, 0))
                 fd = os.open(self.abspath(filename), os.O_WRONLY|os.O_CREAT|os.O_SYNC)
@@ -852,6 +854,7 @@ class pNFSTest(TestUtil):
 
             # Verify network traffic
             self.trace_open(trace1)
+            self.set_pktlist()
             self.find_getdeviceinfo()
             self.pktt.rewind()
             (multipath_ds_list, openfh) = self.verify_file(filename, iomode=iomode)
@@ -861,7 +864,6 @@ class pNFSTest(TestUtil):
             self.test_group("Verify traffic for second file using pNFS within the same mount - %s" % wstr)
             self.verify_file(filename2, iomode=iomode, nocreate=True, multipath_ds_list=multipath_ds_list)
 
-            self.trace_open(trace2)
             if write:
                 if 'deleg_stateid' in openfh and openfh['deleg_stateid'] is not None:
                     # Client should not send another open while holding a delegation
@@ -875,6 +877,8 @@ class pNFSTest(TestUtil):
                 self.test_group("Verify traffic for first file opened again using pNFS within the same mount - %s" % swstr)
                 openfh['samefile'] = True
                 openfh['dtcached'] = True
+                self.trace_open(trace2)
+                self.set_pktlist()
                 self.verify_file(filename, iomode=siomode, nocreate=True, multipath_ds_list=multipath_ds_list, openfh=openfh, delegreturn=delegreturn)
 
             self.session_ids = session_ids
@@ -893,6 +897,7 @@ class pNFSTest(TestUtil):
             open_type = os.O_WRONLY|os.O_CREAT|os.O_SYNC
             lock_type = fcntl.F_WRLCK
 
+        self.test_group("Verify traffic for locked file using pNFS - %s" % mode_str)
         self.umount()
         self.trace_start()
         self.mount()
@@ -926,9 +931,9 @@ class pNFSTest(TestUtil):
 
         if haslock:
             self.trace_open()
+            self.set_pktlist()
             self.find_getdeviceinfo()
             self.pktt.rewind()
-            self.test_group("Verify traffic for locked file using pNFS - %s" % mode_str)
             (multipath_ds_list, openfh) = self.verify_file(filename, iomode=iomode, lock=True)
 
     def do_setattr(self, size=0, lock=False):
@@ -961,12 +966,13 @@ class pNFSTest(TestUtil):
         self.trace_stop()
 
         self.trace_open()
+        self.set_pktlist()
         self.find_getdeviceinfo()
         self.pktt.rewind()
         (multipath_ds_list, openfh) = self.verify_file(filename, iomode=LAYOUTIOMODE4_RW, nolayoutget=True, lock=haslock, verify_close=False)
 
         fhandle_str = "NFS.fh == '%s'" % self.pktt.escape(openfh['filehandle'])
-        (pktcall, pktreply) = self.find_nfs_op(OP_SETATTR, self.server_ipaddr, self.port, status=None, match=fhandle_str)
+        (pktcall, pktreply) = self.find_nfs_op(OP_SETATTR, status=None, match=fhandle_str)
         self.test(pktcall, "SETATTR should be sent to MDS")
         if pktcall:
             sent_stateid = pktcall.NFSop.stateid.other
@@ -1021,6 +1027,7 @@ class pNFSTest(TestUtil):
     def rw_read_test(self):
         """Verify traffic for file opened for read and write: reading file first."""
         try:
+            self.test_group("Verify traffic for file opened for read and write: reading file first")
             self.umount()
             self.trace_start()
             self.mount()
@@ -1041,7 +1048,7 @@ class pNFSTest(TestUtil):
             self.trace_stop()
 
             self.trace_open()
-            self.test_group("Verify traffic for file opened for read and write: reading file first")
+            self.set_pktlist()
             self.find_getdeviceinfo()
             self.pktt.rewind()
             (multipath_ds_list, openfh) = self.verify_file(filename, iomode=LAYOUTIOMODE4_READ, noclose=True)
@@ -1068,6 +1075,7 @@ class pNFSTest(TestUtil):
     def rw_write_test(self):
         """Verify traffic for file opened for read and write: writing file first."""
         try:
+            self.test_group("Verify traffic for file opened for read and write: writing file first")
             self.umount()
             self.trace_start()
             self.mount()
@@ -1079,6 +1087,8 @@ class pNFSTest(TestUtil):
                 self.dprint('DBG3', "Writing %d@%d" % (wsize, wsize))
                 os.lseek(fd, wsize, 0)
                 os.write(fd, self.data_pattern(wsize, wsize))
+                # Flush data to make sure the client sends the write first
+                os.fsync(fd)
 
                 self.dprint('DBG3', "Reading file @0")
                 os.lseek(fd, 0, 0)
@@ -1089,7 +1099,7 @@ class pNFSTest(TestUtil):
             self.trace_stop()
 
             self.trace_open()
-            self.test_group("Verify traffic for file opened for read and write: writing file first")
+            self.set_pktlist()
             self.find_getdeviceinfo()
             self.pktt.rewind()
             (multipath_ds_list, openfh) = self.verify_file(filename, iomode=LAYOUTIOMODE4_RW, noclose=True)
@@ -1145,6 +1155,7 @@ class pNFSTest(TestUtil):
             self.umount()
             self.trace_stop()
             self.trace_open()
+            self.set_pktlist()
 
             self.test(data == '\000' * self.rsize, "Client should read a hole at the beginning of the file after writing")
 
@@ -1158,20 +1169,20 @@ class pNFSTest(TestUtil):
                 ids0 = self.layout['first_stripe_index']
 
             if nds > 1:
-                save_index = self.pktt.index
+                save_index = self.pktt.get_index()
                 ids1 = (ids0 + 1) % nds
 
                 ipaddr = dslist[ids1]['ipaddr']
                 port   = dslist[ids1]['port']
                 # Find WRITE call and reply
-                (pktcall, pktreply) = self.find_nfs_op(OP_WRITE, ipaddr, port)
+                (pktcall, pktreply) = self.find_nfs_op(OP_WRITE, ipaddr=ipaddr, port=port)
                 self.test(pktreply, "Client should send a WRITE to the second DS")
                 self.pktt.rewind(save_index)
 
                 ipaddr = dslist[ids0]['ipaddr']
                 port   = dslist[ids0]['port']
                 # Find WRITE call and reply
-                (pktcall, pktreply) = self.find_nfs_op(OP_WRITE, ipaddr, port)
+                (pktcall, pktreply) = self.find_nfs_op(OP_WRITE, ipaddr=ipaddr, port=port)
                 self.test(not pktreply, "Client should not send a WRITE to the first DS")
                 self.pktt.rewind(save_index)
 
@@ -1179,7 +1190,7 @@ class pNFSTest(TestUtil):
                 # Find READ call and reply
                 ipaddr = dslist[ids0]['ipaddr']
                 port   = dslist[ids0]['port']
-                (pktcall, pktreply) = self.find_nfs_op(OP_READ, ipaddr, port)
+                (pktcall, pktreply) = self.find_nfs_op(OP_READ, ipaddr=ipaddr, port=port)
                 self.test(pktreply, "Client should send a READ to the first DS")
                 if pktreply:
                     self.test(pktreply.NFSop.eof and len(data) == self.rsize, "Client should ignore EOF marker in READ reply for hole")
@@ -1234,6 +1245,7 @@ class pNFSTest(TestUtil):
 
             # Verify network traffic
             self.trace_open()
+            self.set_pktlist()
             self.find_getdeviceinfo()
             self.pktt.rewind()
             self.test_info("Verify READ traffic ========================================")
@@ -1267,6 +1279,7 @@ try:
     for i in xrange(NFILES):
         try:
             x.trace_open()
+            x.set_pktlist()
             (pktcall, pktreply) = x.find_exchange_id()
             x.dprint('INFO', "Client implementation: %s" % x.nii_name)
             x.dprint('INFO', "Server implementation: %s" % x.nii_server)

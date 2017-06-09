@@ -29,7 +29,7 @@ from fcntl import fcntl,F_WRLCK,F_SETLK
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2015 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.0"
+__version__   = "1.2"
 
 USAGE = """%prog --server <server> [options]
 
@@ -205,11 +205,7 @@ class AllocTest(TestUtil):
                 # Default size to allocate or deallocate
                 size = self.filesize
 
-            if dealloc:
-                tname = "dealloc01"
-            else:
-                tname = "alloc01"
-            self.test_info("====  %s test %02d%s" % (tname, self.testidx, msg))
+            self.test_info("====  %s test %02d%s" % (self.testname, self.testidx, msg))
             self.testidx += 1
             self.umount()
 
@@ -358,11 +354,12 @@ class AllocTest(TestUtil):
         try:
             # Process the packet trace to inspect the NFS packets
             self.trace_open()
+            self.set_pktlist()
             # Get the correct state id for the ALLOCATE/DEALLOCATE operation
             self.get_stateid(self.filename)
 
             # Find the ALLOCATE/DEALLOCATE packet call and reply
-            (pktcall, pktreply) = self.find_nfs_op(nfsop, self.server_ipaddr, self.port, status=None)
+            (pktcall, pktreply) = self.find_nfs_op(nfsop, status=None)
             if pktcall:
                 self.dprint('DBG7', str(pktcall))
                 self.dprint('DBG7', str(pktreply))
@@ -375,7 +372,7 @@ class AllocTest(TestUtil):
                 fmsg = ", expecting %d but got %d" % (offset, allocobj.offset)
                 self.test(allocobj.offset == offset, "%s should be sent with correct offset" % opstr.upper(), failmsg=fmsg)
                 fmsg = ", expecting %d but got %d" % (size, allocobj.length)
-                self.test(allocobj.length == size, "%s should be sent with corrent length" % opstr.upper(), failmsg=fmsg)
+                self.test(allocobj.length == size, "%s should be sent with correct length" % opstr.upper(), failmsg=fmsg)
                 self.test(pktreply.nfs.status == 0, "%s should return NFS4_OK" % opstr.upper())
         except Exception:
             self.test(False, traceback.format_exc())
@@ -396,7 +393,7 @@ class AllocTest(TestUtil):
         msg4 = " for a range starting and ending at a non-aligned block size boundary"
         self.alloc01(os.O_WRONLY, offset=blocksize/2, size=blocksize, msg=msg4)
 
-        if self.deleg_stateid is None:
+        if hasattr(self, "deleg_stateid") and self.deleg_stateid is None:
             # Run tests with byte range locking
             msg = " (locking file)"
             self.alloc01(os.O_WRONLY, msg=msg, lock=True)
@@ -427,7 +424,7 @@ class AllocTest(TestUtil):
         msg7 = " when range is fully outside the current file size"
         self.alloc01(os.O_RDWR, offset=self.filesize, size=self.filesize, msg=msg7)
 
-        if self.deleg_stateid is None:
+        if hasattr(self, "deleg_stateid") and self.deleg_stateid is None:
             # Run tests with byte range locking
             msg = " (locking file)"
             self.alloc01(os.O_RDWR, msg=msg, lock=True)
@@ -644,10 +641,11 @@ class AllocTest(TestUtil):
             fd = None
             fd1 = None
             rmfile = None
+            otherfile = None
             offset = 0
             size = self.filesize
 
-            self.test_info("====  alloc06 test %02d%s" % (self.testidx, msg))
+            self.test_info("====  %s test %02d%s" % (self.testname, self.testidx, msg))
             self.testidx += 1
 
             self.umount()
@@ -679,7 +677,7 @@ class AllocTest(TestUtil):
             fd1 = os.open(self.absfile, os.O_WRONLY|os.O_CREAT)
             rmfile = self.absfile
 
-            maxsize = self.get_freebytes()
+            maxsize = self.get_freebytes() - 4*self.statvfs.f_bsize
             strsize = formatstr.str_units(maxsize)
             self.dprint('DBG3', "Allocate %s file (rest of the available disk space)" % strsize)
             out = self.libc.fallocate(fd1, SR_ALLOCATE, 0, maxsize)
@@ -689,17 +687,21 @@ class AllocTest(TestUtil):
                 return
             self.test(out == 0, "ALLOCATE should allocate the maximum number of blocks left on the device")
 
+            # Use the rest of the remaining space and a little bit more
+            filesize = self.get_freebytes() + self.filesize
+
             try:
                 fmsg = ", expecting ENOSPC but it succeeded"
                 werror = None
-                self.create_file()
+                self.create_file(size=filesize)
             except OSError as werror:
                 fmsg = ", expecting ENOSPC but got %s" % errno.errorcode.get(werror.errno,werror.errno)
             expr = werror and werror.errno == errno.ENOSPC
             self.test(expr, "Write to a different file should fail with ENOSPC when no space is left on the device", failmsg=fmsg)
+            otherfile = self.filename
 
             self.dprint('DBG3', "Allocate %s file" % strsize)
-            out = self.libc.fallocate(fd, SR_ALLOCATE, self.filesize, self.filesize)
+            out = self.libc.fallocate(fd, SR_ALLOCATE, offset+size, filesize)
             err = 0
             if out == -1:
                 err = ctypes.get_errno()
@@ -712,7 +714,8 @@ class AllocTest(TestUtil):
                 fmsg = ", expecting ENOSPC but it succeeded"
                 werror = None
                 os.lseek(fd, size, 0)
-                data = self.data_pattern(size, self.filesize)
+                data = self.data_pattern(size, filesize)
+                self.dprint('DBG3', "Write file %s %d@%d" % (self.absfile, len(data), size))
                 count = os.write(fd, data)
                 os.fsync(fd)
             except OSError as werror:
@@ -720,8 +723,9 @@ class AllocTest(TestUtil):
             expr = werror and werror.errno == errno.ENOSPC
             self.test(expr, "Write outside the allocated region should fail with ENOSPC when no space is left on the device", failmsg=fmsg)
 
-            os.lseek(fd, 0, 0)
-            data = self.data_pattern(0, self.filesize, pattern="\x55\xaa")
+            os.lseek(fd, offset, 0)
+            data = self.data_pattern(offset, self.filesize, pattern="\x55\xaa")
+            self.dprint('DBG3', "Write file %s %d@%d" % (self.absfile, len(data), offset))
             count = os.write(fd, data)
             os.fsync(fd)
             self.test(count > 0, "Write within the allocated region should succeed when no space is left on the device"+msg)
@@ -742,12 +746,13 @@ class AllocTest(TestUtil):
 
         try:
             self.trace_open()
+            self.set_pktlist()
             # Find OPEN and correct stateid to use
             self.get_stateid(filename)
-            save_index = self.pktt.index
+            save_index = self.pktt.get_index()
 
             # Find ALLOCATE for file
-            (pktcall, pktreply) = self.find_nfs_op(OP_ALLOCATE, self.server_ipaddr, self.port)
+            (pktcall, pktreply) = self.find_nfs_op(OP_ALLOCATE)
             self.dprint('DBG7', str(pktcall))
             self.dprint('DBG7', str(pktreply))
             self.test(pktcall, "ALLOCATE should be sent to the server")
@@ -757,17 +762,17 @@ class AllocTest(TestUtil):
             fmsg = ", expecting %d but got %d" % (offset, allocobj.offset)
             self.test(allocobj.offset == offset, "ALLOCATE should be sent with correct offset", failmsg=fmsg)
             fmsg = ", expecting %d but got %d" % (size, allocobj.length)
-            self.test(allocobj.length == size, "ALLOCATE should be sent with corrent length", failmsg=fmsg)
+            self.test(allocobj.length == size, "ALLOCATE should be sent with correct length", failmsg=fmsg)
             self.test(pktreply and pktreply.nfs.status == 0, "ALLOCATE should return NFS4_OK")
 
             # Find ALLOCATE which allocates the rest of the disk space
-            (pktcall, pktreply) = self.find_nfs_op(OP_ALLOCATE, self.server_ipaddr, self.port)
+            (pktcall, pktreply) = self.find_nfs_op(OP_ALLOCATE)
             self.dprint('DBG7', str(pktcall))
             self.dprint('DBG7', str(pktreply))
             self.test(pktcall, "ALLOCATE should be sent to the server to fill all disk space")
 
             # Find second ALLOCATE for file
-            (pktcall, pktreply) = self.find_nfs_op(OP_ALLOCATE, self.server_ipaddr, self.port, status=None)
+            (pktcall, pktreply) = self.find_nfs_op(OP_ALLOCATE, status=None)
             self.dprint('DBG7', str(pktcall))
             self.dprint('DBG7', str(pktreply))
             self.test(pktcall, "ALLOCATE should be sent to the server")
@@ -776,8 +781,8 @@ class AllocTest(TestUtil):
             self.test(allocobj.stateid == self.stateid, "ALLOCATE should be sent with correct stateid", failmsg=fmsg)
             fmsg = ", expecting %d but got %d" % (self.filesize, allocobj.offset)
             self.test(allocobj.offset == self.filesize, "ALLOCATE should be sent with correct offset", failmsg=fmsg)
-            fmsg = ", expecting %d but got %d" % (self.filesize, allocobj.length)
-            self.test(allocobj.length == self.filesize, "ALLOCATE should be sent with corrent length", failmsg=fmsg)
+            fmsg = ", expecting %d but got %d" % (filesize, allocobj.length)
+            self.test(allocobj.length == filesize, "ALLOCATE should be sent with correct length", failmsg=fmsg)
             if pktreply:
                 status = pktreply.nfs.status
                 fmsg = ", expecting NFS4ERR_NOSPC but got %s" % nfsstat4.get(status, status)
@@ -785,14 +790,14 @@ class AllocTest(TestUtil):
 
             # Rewind packet trace to search for WRITEs
             in_alloc  = True
-            out_alloc = True
-            non_alloc = True
+            out_alloc = False
+            non_alloc = False
             in_alloc_cnt  = 0
             out_alloc_cnt = 0
             non_alloc_cnt = 0
             while True:
                 self.pktt.rewind(save_index)
-                (pktcall, pktreply) = self.find_nfs_op(OP_WRITE, self.server_ipaddr, self.port, status=None)
+                (pktcall, pktreply) = self.find_nfs_op(OP_WRITE, status=None)
                 if not pktcall:
                     break
                 save_index = pktcall.record.index + 1
@@ -807,13 +812,13 @@ class AllocTest(TestUtil):
                     else:
                         # WRITE sent to non-allocated region
                         out_alloc_cnt += 1
-                        if pktreply.nfs.status != NFS4ERR_NOSPC:
-                            out_alloc = False
+                        if pktreply.nfs.status == NFS4ERR_NOSPC:
+                            out_alloc = True
                 else:
                     # WRITE sent to non-allocated file
                     non_alloc_cnt += 1
-                    if pktreply.nfs.status != NFS4ERR_NOSPC:
-                        non_alloc = False
+                    if pktreply.nfs.status == NFS4ERR_NOSPC:
+                        non_alloc = True
             if in_alloc_cnt > 0:
                 self.test(in_alloc, "WRITE within the allocated region should succeed when no space is left on the device")
             else:
@@ -825,7 +830,21 @@ class AllocTest(TestUtil):
             if non_alloc_cnt > 0:
                 self.test(non_alloc, "WRITE sent to non-allocated file should return NFS4ERR_NOSPC when no space is left on the device")
             else:
-                self.test(False, "WRITE sent to non-allocated file should be sent")
+                # No writes found for other file, look for OPEN to check if
+                # it failed on open instead
+                self.pktt.rewind(0)
+                file_str = "NFS.claim.name == '%s'" % otherfile
+                (pktcall, pktreply) = self.find_nfs_op(OP_OPEN, match=file_str, status=None)
+                if pktreply is None:
+                    # Could not find OPEN, fail with the write error below
+                    status = NFS4_OK
+                else:
+                    status = pktreply.NFSop.status
+                if status != NFS4_OK:
+                    fmsg = ", expecting NFS4ERR_NOSPC but got %s" % nfsstat4.get(status, status)
+                    self.test(status == NFS4ERR_NOSPC, "OPEN sent to non-allocated file should return NFS4ERR_NOSPC", failmsg=fmsg)
+                else:
+                    self.test(False, "WRITE to non-allocated file should be sent")
         except Exception:
             self.test(False, traceback.format_exc())
 
@@ -835,7 +854,7 @@ class AllocTest(TestUtil):
         self.testidx = 1
         self.alloc06()
 
-        if self.deleg_stateid is None:
+        if hasattr(self, "deleg_stateid") and self.deleg_stateid is None:
             # Run tests with byte range locking
             msg = " (locking file)"
             self.alloc06(msg=msg, lock=True)
@@ -862,7 +881,7 @@ class AllocTest(TestUtil):
         msg7 = " when range is fully outside the current file size"
         self.alloc01(os.O_WRONLY, offset=self.filesize, size=self.filesize, msg=msg7, dealloc=True)
 
-        if self.deleg_stateid is None:
+        if hasattr(self, "deleg_stateid") and self.deleg_stateid is None:
             # Run tests with byte range locking
             msg = " (locking file)"
             self.alloc01(os.O_WRONLY, msg=msg, lock=True, dealloc=True)
@@ -896,7 +915,7 @@ class AllocTest(TestUtil):
         msg7 = " when range is fully outside the current file size"
         self.alloc01(os.O_RDWR, offset=self.filesize, size=self.filesize, msg=msg7, dealloc=True)
 
-        if self.deleg_stateid is None:
+        if hasattr(self, "deleg_stateid") and self.deleg_stateid is None:
             # Run tests with byte range locking
             msg = " (locking file)"
             self.alloc01(os.O_RDWR, msg=msg, lock=True, dealloc=True)
@@ -936,7 +955,7 @@ class AllocTest(TestUtil):
             fd = None
             rmfile = None
 
-            self.test_info("====  dealloc06 test %02d%s" % (self.testidx, msg))
+            self.test_info("====  %s test %02d%s" % (self.testname, self.testidx, msg))
             self.testidx += 1
 
             self.umount()
@@ -950,7 +969,7 @@ class AllocTest(TestUtil):
             fd = os.open(self.absfile, os.O_WRONLY|os.O_CREAT)
             rmfile = self.absfile
 
-            maxsize = self.get_freebytes()
+            maxsize = self.get_freebytes() - 4*self.statvfs.f_bsize
             strsize = formatstr.str_units(maxsize)
             self.dprint('DBG3', "Allocate %s file (rest of the available disk space)" % strsize)
             out = self.libc.fallocate(fd, SR_ALLOCATE, 0, maxsize)
@@ -960,18 +979,21 @@ class AllocTest(TestUtil):
                 return
             self.test(out == 0, "ALLOCATE should allocate the maximum number of blocks left on the device")
 
+            # Use the rest of the remaining space and a little bit more
+            filesize = self.get_freebytes() + self.filesize
+
             # Try creating a file to make sure there is no more disk space
             try:
                 fmsg = ", expecting ENOSPC but it succeeded"
                 werror = None
-                self.create_file()
+                self.create_file(size=filesize)
             except OSError as werror:
                 fmsg = ", expecting ENOSPC but got %s" % errno.errorcode.get(werror.errno,werror.errno)
             expr = werror and werror.errno == errno.ENOSPC
             self.test(expr, "Write to a different file should fail with ENOSPC when no space is left on the device", failmsg=fmsg)
 
             offset = 0
-            size = 2*self.filesize
+            size = 2*self.filesize + 4*self.statvfs.f_bsize
             # Free space after deallocate
             free_space = size - offset
             strsize = formatstr.str_units(size)
@@ -993,6 +1015,7 @@ class AllocTest(TestUtil):
                 werror = None
                 os.lseek(fd, offset, 0)
                 data = self.data_pattern(offset, self.filesize)
+                self.dprint('DBG3', "Write file %s %d@%d" % (self.absfile, len(data), offset))
                 count = os.write(fd, data)
                 os.fsync(fd)
             except OSError as werror:
@@ -1014,6 +1037,7 @@ class AllocTest(TestUtil):
                 werror = None
                 os.lseek(fd, offset+self.filesize, 0)
                 data = self.data_pattern(offset+self.filesize, self.filesize)
+                self.dprint('DBG3', "Write file %s %d@%d" % (self.absfile, len(data), offset+self.filesize))
                 count = os.write(fd, data)
                 os.fsync(fd)
             except OSError as werror:
@@ -1035,11 +1059,12 @@ class AllocTest(TestUtil):
 
         try:
             self.trace_open()
+            self.set_pktlist()
             # Find OPEN and correct stateid to use
             self.get_stateid(filename)
 
             # Find DEALLOCATE for file
-            (pktcall, pktreply) = self.find_nfs_op(OP_DEALLOCATE, self.server_ipaddr, self.port)
+            (pktcall, pktreply) = self.find_nfs_op(OP_DEALLOCATE)
             self.dprint('DBG7', str(pktcall))
             self.dprint('DBG7', str(pktreply))
             self.test(pktcall, "DEALLOCATE should be sent to the server")
@@ -1049,19 +1074,19 @@ class AllocTest(TestUtil):
             fmsg = ", expecting %d but got %d" % (offset, allocobj.offset)
             self.test(allocobj.offset == offset, "DEALLOCATE should be sent with correct offset", failmsg=fmsg)
             fmsg = ", expecting %d but got %d" % (size, allocobj.length)
-            self.test(allocobj.length == size, "DEALLOCATE should be sent with corrent length", failmsg=fmsg)
+            self.test(allocobj.length == size, "DEALLOCATE should be sent with correct length", failmsg=fmsg)
             self.test(pktreply and pktreply.nfs.status == 0, "DEALLOCATE should return NFS4_OK")
 
             in_dealloc  = True
-            out_dealloc = True
-            non_dealloc = True
+            out_dealloc = False
+            non_dealloc = False
             in_dealloc_cnt  = 0
             out_dealloc_cnt = 0
             non_dealloc_cnt = 0
-            save_index = self.pktt.index
+            save_index = self.pktt.get_index()
             while True:
                 self.pktt.rewind(save_index)
-                (pktcall, pktreply) = self.find_nfs_op(OP_WRITE, self.server_ipaddr, self.port, status=None)
+                (pktcall, pktreply) = self.find_nfs_op(OP_WRITE, status=None)
                 if not pktcall:
                     break
                 save_index = pktcall.record.index + 1
@@ -1077,21 +1102,21 @@ class AllocTest(TestUtil):
                     else:
                         # WRITE sent to deallocated region when space is no longer available
                         out_dealloc_cnt += 1
-                        if pktreply.nfs.status != NFS4ERR_NOSPC:
-                            out_dealloc = False
+                        if pktreply.nfs.status == NFS4ERR_NOSPC:
+                            out_dealloc = True
                 else:
                     # WRITE sent to different file
                     non_dealloc_cnt += 1
-                    if pktreply.nfs.status != NFS4_OK:
-                        non_dealloc = False
+                    if pktreply.nfs.status == NFS4_OK:
+                        non_dealloc = True
             if in_dealloc_cnt > 0:
                 self.test(in_dealloc, "WRITE within the deallocated region should succeed")
             else:
                 self.test(False, "WRITE within the deallocated region should be sent")
             if non_dealloc_cnt > 0:
-                self.test(non_dealloc, "WRITE sent to another file should succeed when no space is left on the device after a succesful DEALLOCATE")
+                self.test(non_dealloc, "WRITE sent to another file should succeed when no space is left on the device after a successful DEALLOCATE")
             else:
-                self.test(False, "WRITE shoud be sent to another file when no space is left on the device after a succesful DEALLOCATE")
+                self.test(False, "WRITE should be sent to another file when no space is left on the device after a successful DEALLOCATE")
             if out_dealloc_cnt > 0:
                 self.test(out_dealloc, "WRITE within the deallocated region should fail with NFS4ERR_NOSPC when no space is left on the device")
             else:
@@ -1105,7 +1130,7 @@ class AllocTest(TestUtil):
         self.testidx = 1
         self.dealloc06()
 
-        if self.deleg_stateid is None:
+        if hasattr(self, "deleg_stateid") and self.deleg_stateid is None:
             # Run tests with byte range locking
             msg = " (locking file)"
             self.dealloc06(msg=msg, lock=True)
@@ -1187,7 +1212,7 @@ class AllocTest(TestUtil):
         self.mount()
         self.testidx = 1
         while True:
-            self.test_info("====  perf01 test %02d" % (self.testidx))
+            self.test_info("====  %s test %02d" % (self.testname, self.testidx))
             self.testidx += 1
             tstart = time.time()
             self.perftest(filesize)

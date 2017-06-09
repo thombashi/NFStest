@@ -18,11 +18,10 @@ from nfstest.file_io import *
 from optparse import OptionParser, OptionGroup, IndentedHelpFormatter
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
-__version__   = '1.0.1'
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2014 NetApp, Inc."
 __license__   = "GPL v2"
-
+__version__   = "1.2"
 
 USAGE = """%prog -d <datadir> [options]
 
@@ -47,32 +46,32 @@ opts.add_option("-v", "--verbose", default="none", help="Verbose level: none|inf
 opts.add_option("-e", "--exiterr", action="store_true", default=False, help="Exit on first error")
 
 writegroup = OptionGroup(opts, "Read and write")
-writegroup.add_option("--read",     type="int", default=P_READ,   help="Read file percentage [default: %default]")
-writegroup.add_option("--write",    type="int", default=P_WRITE,  help="Write file percentage [default: %default]")
-writegroup.add_option("--rdwr",     type="int", default=P_RDWR,   help="Read/write file percentage [default: %default]")
-writegroup.add_option("--randio",   type="int", default=P_RANDIO, help="Random file access percentage [default: %default]")
+writegroup.add_option("--read",     type="float", default=P_READ,   help="Read file percentage [default: %default]")
+writegroup.add_option("--write",    type="float", default=P_WRITE,  help="Write file percentage [default: %default]")
+writegroup.add_option("--rdwr",     type="float", default=P_RDWR,   help="Read/write file percentage [default: %default]")
+writegroup.add_option("--randio",   type="float", default=P_RANDIO, help="Random file access percentage [default: %default]")
 writegroup.add_option("--iodelay",  type="float", default=P_IODELAY, help="Seconds to delay I/O operations [default: %default]")
 writegroup.add_option("--direct",   action="store_true", default=False, help="Use direct I/O")
 writegroup.add_option("--rdwronly", action="store_true", default=False, help="Use read and write only, no rename, remove, etc.")
 opts.add_option_group(writegroup)
 
 opgroup = OptionGroup(opts, "File operations")
-opgroup.add_option("--create",   type="int", default=P_CREATE,   help="Create file percentage [default: %default]")
-opgroup.add_option("--odgrade",  type="int", default=P_ODGRADE,  help="Open downgrade percentage [default: %default]")
-opgroup.add_option("--osync",    type="int", default=P_OSYNC,    help="Open file with O_SYNC [default: %default]")
-opgroup.add_option("--fsync",    type="int", default=P_FSYNC,    help="Percentage of fsync after write [default: %default]")
-opgroup.add_option("--rename",   type="int", default=P_RENAME,   help="Rename file percentage [default: %default]")
-opgroup.add_option("--remove",   type="int", default=P_REMOVE,   help="Remove file percentage [default: %default]")
-opgroup.add_option("--trunc",    type="int", default=P_TRUNC,    help="Truncate file percentage [default: %default]")
-opgroup.add_option("--ftrunc",   type="int", default=P_FTRUNC,   help="Truncate opened file percentage [default: %default]")
-opgroup.add_option("--link",     type="int", default=P_LINK,     help="Create hard link percentage [default: %default]")
-opgroup.add_option("--slink",    type="int", default=P_SLINK,    help="Create symbolic link percentage [default: %default]")
-opgroup.add_option("--readdir",  type="int", default=P_READDIR,  help="List contents of directory percentage [default: %default]")
-opgroup.add_option("--lock",     type="int", default=P_LOCK,     help="Lock file percentage [default: %default]")
-opgroup.add_option("--unlock",   type="int", default=P_UNLOCK,   help="Unlock file percentage [default: %default]")
-opgroup.add_option("--tlock",    type="int", default=P_TLOCK,    help="Lock test percentage [default: %default]")
-opgroup.add_option("--lockfull", type="int", default=P_LOCKFULL, help="Lock full file percentage [default: %default]")
-opgroup.add_option("--minfiles", default=str(MIN_FILES),  help="Mininum number of files to create before any file operation is executed [default: %default]")
+opgroup.add_option("--create",   type="float", default=P_CREATE,   help="Create file percentage [default: %default]")
+opgroup.add_option("--odgrade",  type="float", default=P_ODGRADE,  help="Open downgrade percentage [default: %default]")
+opgroup.add_option("--osync",    type="float", default=P_OSYNC,    help="Open file with O_SYNC [default: %default]")
+opgroup.add_option("--fsync",    type="float", default=P_FSYNC,    help="Percentage of fsync after write [default: %default]")
+opgroup.add_option("--rename",   type="float", default=P_RENAME,   help="Rename file percentage [default: %default]")
+opgroup.add_option("--remove",   type="float", default=P_REMOVE,   help="Remove file percentage [default: %default]")
+opgroup.add_option("--trunc",    type="float", default=P_TRUNC,    help="Truncate file percentage [default: %default]")
+opgroup.add_option("--ftrunc",   type="float", default=P_FTRUNC,   help="Truncate opened file percentage [default: %default]")
+opgroup.add_option("--link",     type="float", default=P_LINK,     help="Create hard link percentage [default: %default]")
+opgroup.add_option("--slink",    type="float", default=P_SLINK,    help="Create symbolic link percentage [default: %default]")
+opgroup.add_option("--readdir",  type="float", default=P_READDIR,  help="List contents of directory percentage [default: %default]")
+opgroup.add_option("--lock",     type="float", default=P_LOCK,     help="Lock file percentage [default: %default]")
+opgroup.add_option("--unlock",   type="float", default=P_UNLOCK,   help="Unlock file percentage [default: %default]")
+opgroup.add_option("--tlock",    type="float", default=P_TLOCK,    help="Lock test percentage [default: %default]")
+opgroup.add_option("--lockfull", type="float", default=P_LOCKFULL, help="Lock full file percentage [default: %default]")
+opgroup.add_option("--minfiles", default=str(MIN_FILES),  help="Minimum number of files to create before any file operation is executed [default: %default]")
 opts.add_option_group(opgroup)
 
 filegroup = OptionGroup(opts, "File size options")

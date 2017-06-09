@@ -27,16 +27,17 @@ from pprint import pformat
 from formatstr import FormatStr
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = '1.0.6'
+__version__   = "1.2"
 
 # Module variables
 _dindent = ""
 _sindent = "    "
 _dlevel = 0
 _rlevel = 1
+_dcount = 0
 _strsize = 0
 _logfh = None
 _tstamp = True
@@ -300,6 +301,12 @@ class BaseObj(object):
                 if val != None:
                     if isrepr:
                         value = pformat(val, indent=0)
+                        if (isinstance(val, list) or isinstance(val, dict)) and value.find("\n") > 0:
+                            # If list or dictionary have more than one line as
+                            # returned from pformat, add an extra new line
+                            # between opening and closing brackets and add
+                            # another indentation to the body
+                            value = (value[0] + "\n" + value[1:-1]).replace("\n", "\n"+_sindent) + "\n" + value[-1]
                         out.append("%s%s = %s,\n" % (_sindent, key, value.replace("\n", "\n"+_sindent)))
                     else:
                         out.append("%s=%s" % (key, self._str_value(val)))
@@ -559,6 +566,11 @@ class BaseObj(object):
         if _logfh != None:
             _logfh.flush()
 
+    @staticmethod
+    def dprint_count():
+        """Return the number of dprint messages actually displayed."""
+        return _dcount
+
     def format(self, fmt, *kwts, **kwds):
         """Format the arguments and return the string using the format given.
            If no arguments are given either positional or named then object
@@ -610,3 +622,5 @@ class BaseObj(object):
                 ret = ret.replace("\n", "\n"+sp)
             print ret
             self.write_log(ret)
+            global _dcount
+            _dcount += 1

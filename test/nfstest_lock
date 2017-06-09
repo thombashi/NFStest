@@ -18,8 +18,8 @@ import errno
 import signal
 import struct
 import traceback
+from formatstr import *
 import nfstest_config as c
-from nfstest.rexec import Rexec
 from nfstest.test_util import TestUtil
 from fcntl import fcntl,F_RDLCK,F_WRLCK,F_UNLCK,F_SETLK,F_SETLKW,F_GETLK
 
@@ -27,7 +27,7 @@ from fcntl import fcntl,F_RDLCK,F_WRLCK,F_UNLCK,F_SETLK,F_SETLKW,F_GETLK
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2013 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.1"
+__version__   = "1.2"
 
 USAGE = """%prog --server <server> [--client <client>] [options]
 
@@ -209,9 +209,9 @@ class LockTest(TestUtil):
         hmsg = "Remote NFS client used for conflicting lock tests"
         self.test_opgroup.add_option("--client", default=None, help=hmsg)
         hmsg = "Offset of first lock granted [default: %default]"
-        self.test_opgroup.add_option("--offset", type="int", default=4096, help=hmsg)
+        self.test_opgroup.add_option("--offset", default="4k", help=hmsg)
         hmsg = "Length of first lock granted [default: %default]"
-        self.test_opgroup.add_option("--length", type="int", default=4096, help=hmsg)
+        self.test_opgroup.add_option("--length", default="4k", help=hmsg)
         # Object attribute: self.unlock_delay
         hmsg = "Time in seconds to unlock first lock [default: %default]"
         self.test_opgroup.add_option("--unlock-delay", type="float", default=2.0, help=hmsg)
@@ -237,6 +237,10 @@ class LockTest(TestUtil):
         self.cap_opgroup.add_option("--subtraces", action="store_true", default=False, help=hmsg)
         self.scan_options()
         self.st_time = time.time()
+
+        # Convert units
+        self.offset = int_units(self.offset)
+        self.length = int_units(self.length)
 
         if self.subtraces:
             # Disable createtraces option since a packet trace will be created
@@ -266,9 +270,6 @@ class LockTest(TestUtil):
             self.opts.error("invalid type given in --locktype2 [%s]" % self.locktype2)
         if self.setl_list is None:
             self.opts.error("invalid type given in --setlock [%s]" % self.setlock)
-
-        self.mtindex = 1
-        self.rexecobjs = []
 
         self.client_opts()
         if len(self.client_list) > 1:
@@ -357,8 +358,8 @@ class LockTest(TestUtil):
 
         # Start remote procedure server on host
         if not remote_process or len(self.client_list) < 1:
+            self.rexecobj  = None
             self.clientobj = None
-            self.rexecobj = None
             for tname in NCTESTS + OCTESTS:
                 if tname in self.testlist:
                     self.testlist.remove(tname)
@@ -368,12 +369,10 @@ class LockTest(TestUtil):
             for client_d in self.client_list:
                 client_args = dict(client_d)
                 client_name = client_args.pop('client')
-                self.mtindex += 1
                 self.create_host(client_name, **client_args)
                 self.clientobj.umount()
                 self.clientobj.mount()
-                self.rexecobj = self.start_rexec(client_name)
-                self.rexecobjs.append(self.rexecobj)
+                self.start_rexec(client_name)
 
         # Unmount server on local host
         self.umount()
@@ -391,14 +390,8 @@ class LockTest(TestUtil):
            clientname:
                Name of client where the remote procedure server will be started
         """
-        logfile = None
-        if self.createlog:
-            logfile = self.get_logname()
-
         # Start remote procedure server on given client
-        svr = "at %s" % clientname if len(clientname) else "locally"
-        self.dprint('DBG2', "Start remote procedure server %s" % svr)
-        execobj = Rexec(clientname, logfile=logfile)
+        execobj = self.create_rexec(clientname)
 
         # Setup function to lock and unlock a file
         execobj.rimport("fcntl", ["fcntl", "F_SETLK"])

@@ -24,7 +24,7 @@ from optparse import OptionParser, IndentedHelpFormatter
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2014 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.1"
+__version__   = "1.2"
 
 USAGE = """%prog [options] <xdrfile1.x> [<xdrfile2.x> ...]
 
@@ -549,14 +549,14 @@ class XDRobject:
         return
 
     def get_comments(self, comm_list, strline, spnam, sppre, ctype=False, newobj=False):
-        """Returns a tupple of two comments to display, the first one is
+        """Returns a tuple of two comments to display, the first one is
            the main comment to be displayed before the python code and
            the second comment is the inline comment.
 
            comm_list:
                List of comments: (inline, multi, old)
            strline:
-               Python code to be displayed. This is used for formating the
+               Python code to be displayed. This is used for formatting the
                multi-line comments going as inline comments
            spnam:
                Extra spaces to match the longest variable name to line up
@@ -876,7 +876,7 @@ class XDRobject:
             return '"%s"' % strfmt
 
     def set_strfmt(self, fd, deftags, indent):
-        """Process the STRFMT1 and STRFMT2 tags and write the set_fortmat
+        """Process the STRFMT1 and STRFMT2 tags and write the set_strfmt
            calls to the output file
 
            fd:
@@ -1455,7 +1455,7 @@ class XDRobject:
                 constlist = []
                 self.old_comment = []
             elif deftype in [ENUM, BITMAP]:
-                regex = re.search(r"^\s*([\w\d]+)\s*=\s*([^,;\s]+),?.*", line)
+                regex = re.search(r"^\s*([\w\-]+)\s*=\s*([^,;\s]+),?.*", line)
                 ename  = regex.group(1).strip()
                 evalue = regex.group(2).strip()
                 comms = [self.inline_comment, self.multi_comment, self.old_comment]
@@ -1508,7 +1508,7 @@ class XDRobject:
                         spnam = " " * (value_maxlen - len(item[1]))
                         if len(item[0]):
                             sps = " " * (name_maxlen - len(item[0]))
-                            out = "%s%s = %s" % (item[0], sps, item[1])
+                            out = "%s%s = %s" % (item[0].replace("-", "_"), sps, item[1])
                         mcommstr, incommstr = self.get_comments(item[2], out, spnam, "")
                         if len(mcommstr):
                             fd.write(mcommstr)
@@ -1614,6 +1614,12 @@ class XDRobject:
 
             if deftype is None:
                 deftype, defname, deftags, defcomments = self.process_def(line)
+                # Process CLASSATTR
+                classattr = []
+                cattrs = deftags.get("CLASSATTR")
+                if cattrs is not None:
+                    for cattr in cattrs.split(","):
+                        classattr.append(cattr.split("="))
                 if deftype is None:
                     regex = re.search(r"^\s*typedef\s" + vardefstr, line)
                     if regex:
@@ -1689,8 +1695,12 @@ class XDRobject:
                     if defname == "bool":
                         # Rename "bool" definition
                         defname = "nfs_bool"
-                    objdesc = '    """enum %s"""\n    ' % defname
-                    out = "class %s(Enum):\n%s_enumdict = const.%s" % (defname, objdesc, defname)
+                    objdesc = '    """enum %s"""' % defname
+                    out = "class %s(Enum):\n%s" % (defname, objdesc)
+                    classattr.append(["_enumdict", "const.%s" % defname])
+                    lmax = max([len(x[0]) for x in classattr])
+                    for cattr in classattr:
+                        out += "\n    %-*s = %s" % (lmax, cattr[0], cattr[1])
                     mcommstr, incommstr = self.get_comments(defcomments, out, "", "", newobj=True)
                     if len(mcommstr):
                         fd.write(mcommstr)

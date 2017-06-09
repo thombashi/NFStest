@@ -23,6 +23,7 @@ from rpc_const import *
 import nfstest_config as c
 from baseobj import BaseObj
 from packet.nfs.nfs import NFS
+from packet.utils import IntHex
 from rpc_creds import rpc_credential
 from packet.nfs.nlm4 import NLM4args,NLM4res
 from packet.nfs.mount3 import MOUNT3args,MOUNT3res
@@ -32,7 +33,7 @@ from packet.nfs.portmap2 import PORTMAP2args,PORTMAP2res
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.1"
+__version__   = "1.3"
 
 class Header(BaseObj):
     """Header object"""
@@ -91,7 +92,7 @@ class RPC(GSS):
                    size   = int,
                ),
                verifier = Credential(
-                   data   =string,
+                   data   = string,
                    flavor = int,
                    size   = int,
                ),
@@ -164,6 +165,7 @@ class RPC(GSS):
         """Internal method to decode RPC header"""
         pktt = self._pktt
         unpack = pktt.unpack
+        init_size = unpack.size()
         if self._proto == 6:
             # TCP packet
             save_data = ''
@@ -190,7 +192,7 @@ class RPC(GSS):
             return
 
         # Decode XID and RPC type
-        self.xid  = unpack.unpack_uint()
+        self.xid  = IntHex(unpack.unpack_uint())
         self.type = unpack.unpack_uint()
 
         if self.type == CALL:
@@ -235,6 +237,10 @@ class RPC(GSS):
                 return
         else:
             return
+
+        if self._proto == 6:
+            hsize = init_size - unpack.size() - 4
+            self.fragment_hdr.data_size = self.fragment_hdr.size - hsize
 
         self._rpc = True
         if not self._state:
@@ -286,10 +292,14 @@ class RPC(GSS):
                     prog += " %s: %d," % (item, value)
         if rdebug == 1:
             rtype = "%-5s" % msg_type.get(self.type, 'Unknown').lower()
-            out = "RPC %s %s xid: 0x%08x" % (rtype, prog, self.xid)
+            out = "RPC %s %s xid: %s" % (rtype, prog, self.xid)
         elif rdebug == 2:
             rtype = "%-5s(%d)" % (msg_type.get(self.type, 'Unknown'), self.type)
-            out = "%s,%s xid: 0x%08x" % (rtype, prog, self.xid)
+            if self.type == CALL:
+                creds = ", %s" % self.credential
+            else:
+                creds = ", %s" % self.verifier
+            out = "%s,%s xid: %s%s" % (rtype, prog, self.xid, creds)
         else:
             out = BaseObj.__str__(self)
         return out
@@ -393,6 +403,12 @@ class RPC(GSS):
                 # in the transient program range is considered a callback
                 layer = "nfs"
                 ret = NFS(self, True)
+            else:
+                # Unable to decode RPC load so just get the load bytes
+                if self._proto == 6:
+                    self.data = unpack.read(self.fragment_hdr.data_size)
+                else:
+                    self.data = unpack.read(unpack.size())
 
             if ret:
                 ret._rpc = self

@@ -36,7 +36,7 @@ FTYPE_SP_DEALLOC = 3 # Sparse file (use deallocate to create holes)
 SR_ALLOCATE   = 0 # Allocate
 SR_DEALLOCATE = 3 # FALLOC_FL_KEEP_SIZE|FALLOC_FL_PUNCH_HOLE
 
-# Sparse file contants
+# Sparse file constants
 SP_HOLE = 0 # Hole segment
 SP_DATA = 1 # Data segment
 
@@ -48,13 +48,21 @@ SEEKmap = {
     SEEK_HOLE: "SEEK_HOLE",
 }
 
+def split_path(path):
+    """Return list of components in path"""
+    ret = os.path.normpath(path).split(os.sep)
+    # Remove leading empty component and "." entry
+    while len(ret) and ret[0] in ("", "."):
+        ret.pop(0)
+    return ret
+
 class SparseFile(BaseObj):
     """SparseFile object
 
        SparseFile() -> New sparse file object
 
        Usage:
-           # Create defintion for a sparse file of size 10000 having
+           # Create definition for a sparse file of size 10000 having
            # two holes of size 1000 at offsets 3000 and 6000
            x = SparseFile("/mnt/t/file1", 10000, [3000, 6000], 1000)
 
@@ -69,7 +77,7 @@ class SparseFile(BaseObj):
            # x.data_offsets = [0, 4000, 7000]
 
            # hole_offsets: list of hole segment offsets including the
-           #   imlicit hole at the end of the file
+           #   implicit hole at the end of the file
            # x.hole_offsets = [3000, 6000, 10000]
 
            # sparse_data: list of data/hole segments, each item in the list

@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2015 IETF Trust and the persons identified
- * as the document authors.  All rights reserved.
+ * Copyright (c) 2016 IETF Trust and the persons identified
+ * as the authors.  All rights reserved.
  *
- * The Redistribution and use in source and binary forms, with
+ * Redistribution and use in source and binary forms, with
  * or without modification, are permitted provided that the
  * following conditions are met:
  *
@@ -36,7 +36,7 @@
  *   IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
  *   ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * This code was derived from [draft-ietf-nfsv4-minorversion2-dot-x-39].
+ * This code was derived from RFC 7863.
  *
  *  Copyright (C) The IETF Trust (2007-2014)
  *  All Rights Reserved.
@@ -848,6 +848,12 @@ struct sec_label4 {
     opaque                  data<>;
 };
 
+/* STRFMT1: mode:{0} umask:{1} */
+struct mode_umask4 {
+    mode4  mode;
+    mode4  umask;
+};
+
 /* Used in RPCSEC_GSSv3 */
 struct copy_from_auth_priv {
     secret4             secret;
@@ -920,7 +926,7 @@ typedef uint64_t                fattr4_quota_avail_soft;
 typedef uint64_t                fattr4_quota_used;
 typedef specdata4               fattr4_rawdev;
 typedef uint64_t                fattr4_space_avail;
-typedef uint64_t                fattr4_space_free;
+typedef length4                 fattr4_space_free;
 typedef uint64_t                fattr4_space_total;
 typedef uint64_t                fattr4_space_used;
 typedef bool                    fattr4_system;
@@ -963,6 +969,7 @@ typedef uint64_t                fattr4_clone_blksize;
 typedef uint64_t                fattr4_space_freed;
 typedef change_attr_type4       fattr4_change_attr_type;
 typedef sec_label4              fattr4_sec_label;
+typedef mode_umask4             fattr4_mode_umask;
 
 /* FMAP:1 */
 enum nfs_fattr4 {
@@ -1062,6 +1069,7 @@ enum nfs_fattr4 {
     FATTR4_SPACE_FREED        = 78,
     FATTR4_CHANGE_ATTR_TYPE   = 79,
     FATTR4_SEC_LABEL          = 80,
+    FATTR4_MODE_UMASK         = 81, /* draft-bfields-nfsv4-umask-01 */
 };
 
 /*
@@ -2427,7 +2435,7 @@ union callback_sec_parms4 switch (nfs_secflavor4 flavor) {
     case AUTH_NONE:
         void;
     case AUTH_SYS:
-        authsys_parms   sys_cred; /* RFC 1831 */
+        authsys_parms   sys_cred; /* RFC 5531 */
     case RPCSEC_GSS:
         gss_cb_handles4 gss_handles;
 };
@@ -2611,7 +2619,7 @@ const CREATE_SESSION4_FLAG_PERSIST              = 0x00000001;
 const CREATE_SESSION4_FLAG_CONN_BACK_CHAN       = 0x00000002;
 const CREATE_SESSION4_FLAG_CONN_RDMA            = 0x00000004;
 
-/* STRFMT1: clientid:{0} seqid:{1} cb_prog:{5:#010x} */
+/* STRFMT1: clientid:{0} seqid:{1} flags:{2:#010x} cb_prog:{5:#010x} */
 struct CREATE_SESSION4args {
     clientid4               clientid;
     sequenceid4             sequenceid;
@@ -2625,7 +2633,7 @@ struct CREATE_SESSION4args {
     callback_sec_parms4     sec_parms<>;
 };
 
-/* STRFMT1: sessionid:{0:crc32} seqid:{1} */
+/* STRFMT1: sessionid:{0:crc32} seqid:{1} flags:{2:#010x} */
 struct CREATE_SESSION4resok {
     sessionid4              sessionid;
     sequenceid4             sequenceid;
@@ -3154,15 +3162,15 @@ struct COPY4args {
     netloc4         src_servers<>;
 };
 
-/* STRFMT1: stid:{0} len:{1:umax64} verf:{3} {2} */
+/* STRFMT1: {0:?stid\:{0} }len:{1:umax64} verf:{3} {2} */
 struct write_response4 {
-    stateid4        callback_id<1>;
+    stateid4        stateid<1>;
     length4         count;
     stable_how4     committed;
     verifier4       verifier;
 };
 
-/* STRFMT1: cons:{2} sync:{3} */
+/* STRFMT1: cons:{0} sync:{1} */
 struct copy_requirements4 {
     bool            consecutive;
     bool            synchronous;
@@ -3170,8 +3178,8 @@ struct copy_requirements4 {
 
 /* STRFMT1: {0} {1} */
 struct COPY4resok {
-    write_response4         response;
-    copy_requirements4      requirements;
+    write_response4         response;     /* FLATATTR:1 */
+    copy_requirements4      requirements; /* FLATATTR:1 */
 };
 
 /* STRFMT1: {1} */
@@ -3196,7 +3204,7 @@ struct COPY_NOTIFY4args {
     netloc4   dst_server;
 };
 
-/* STRFMT1: lease:{0} stid:{1} {2} */
+/* STRFMT1: stid:{1} {2} */
 struct COPY_NOTIFY4resok {
     nfstime4  lease_time;
     stateid4  stateid;
@@ -4234,18 +4242,20 @@ struct CB_NOTIFY_DEVICEID4res {
  * CB_OFFLOAD: Report Results of an Asynchronous Operation
  * ======================================================================
  */
+/* STRFMT1: {1} */
 union offload_info4 switch (nfsstat4 status) {
     case NFS4_OK:
         write_response4 resok;
     default:
+        /* STRFMT1: len:{1} {0} */
         length4         count;
 };
 
-/* STRFMT1: FH:{0:crc32} stid:{1} */
+/* STRFMT1: FH:{0:crc32} stid:{1} {2} */
 struct CB_OFFLOAD4args {
     nfs_fh4         fh;
     stateid4        stateid;
-    offload_info4   info;
+    offload_info4   info; /* FLATATTR:1 */
 };
 
 /* STRFMT1: "" */

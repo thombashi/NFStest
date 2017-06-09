@@ -23,13 +23,13 @@ This module also includes some module variables to change how certain
 objects are displayed.
 """
 import nfstest_config as c
-from baseobj import BaseObj
+from baseobj import BaseObj, fstrobj
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2014 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = '1.1'
+__version__   = "1.3"
 
 # RPC type constants
 RPC_CALL  = 0
@@ -47,17 +47,31 @@ NFS_mainop = False # Display only the main operation in an NFS COMPOUND
 LOAD_body  = True  # Display the body of layer/procedure/operation
 
 # Module variables for Enum
-ENUM_CHECK = True
+ENUM_CHECK = False
+
+class ShortHex(int):
+    """Short integer object which is displayed in hex"""
+    def __str__(self):
+        return "0x%04x" % self
+    __repr__ = __str__
 
 class IntHex(int):
     """Integer object which is displayed in hex"""
     def __str__(self):
-        return "{0:#010x}".format(self)
+        return "0x%08x" % self
+    __repr__ = __str__
 
 class LongHex(long):
     """Long integer object which is displayed in hex"""
     def __str__(self):
-        return "{0:#018x}".format(self)
+        return "0x%016x" % self
+    __repr__ = __str__
+
+class DateStr(float):
+    """Floating point object which is displayed as a date"""
+    _strfmt = "{0:date}"
+    def __str__(self):
+        return repr(fstrobj.format(self._strfmt, self))
 
 class StrHex(str):
     """String object which is displayed in hex"""
@@ -142,6 +156,77 @@ def bitmap_dict(unpack, bitmap, func_map, name_map=None):
         bitmap = bitmap >> 1
         bitnum += 1
     return ret
+
+class OptionFlags(BaseObj):
+    """OptionFlags base object
+
+       This base class is used to have a set of raw flags represented by an
+       integer and splits every bit into an object attribute according to the
+       class attribute _bitnames where the key is the bit number and the value
+       is the attribute name.
+
+       This should only be used as a base class where the class attribute
+       _bitnames should be initialized. The class attribute _reversed can
+       also be initialized to reverse the _bitnames so the first bit becomes
+       the last, e.g., _reversed = 31, bits are reversed on a 32 bit integer
+       so 0 becomes 31, 1 becomes 30, etc.
+
+       Usage:
+           from packet.utils import OptionFlags
+
+           class MyFlags(OptionFlags):
+               _bitnames = {0:"bit0", 1:"bit1", 2:"bit2", 3:"bit3"}
+
+           x = MyFlags(10) # 10 = 0b1010
+
+           The attributes of object are:
+               x.rawflags = 10, # Original raw flags
+               x.bit0     = 0,
+               x.bit1     = 1,
+               x.bit2     = 0,
+               x.bit3     = 1,
+    """
+    _strfmt1  = "{0}"
+    _strfmt2  = "{0}"
+    _rawfunc  = IntHex # Raw flags object modifier
+    _attrlist = ("rawflags",)
+    # Dictionary where key is bit number and value is attribute name
+    _bitnames = {}
+    # Bit numbers are reversed if > 0, this is the max number of bits in flags
+    # if set to 31, bits are reversed on a 32 bit integer (0 becomes 31, etc.)
+    _reversed = 0
+
+    def __init__(self, options):
+        """Initialize object's private data.
+
+           options:
+               Unsigned integer of raw flags
+        """
+        self.rawflags = self._rawfunc(options) # Raw option flags
+        bitnames = self._bitnames
+        for bit,name in bitnames.items():
+            if self._reversed > 0:
+                # Bit numbers are reversed
+                bit = self._reversed - bit
+            setattr(self, name, (options >> bit) & 0x01)
+        # Get attribute list sorted by its bit number
+        self._attrlist += tuple(bitnames[k] for k in sorted(bitnames))
+
+    def str_flags(self):
+        """Display the flag names which are set, e.g., in the above example
+           the output will be "bit1,bit3" (bit1=1, bit3=1)
+           Use "__str__ = OptionFlags.str_flags" to have it as the default
+           string representation
+        """
+        ulist = []
+        bitnames = self._bitnames
+        for bit in sorted(bitnames):
+            if self._reversed > 0:
+                # Bit numbers are reversed
+                bit = self._reversed - bit
+            if (self.rawflags >> bit) & 0x01:
+                ulist.append(bitnames[bit])
+        return ",".join(ulist)
 
 class RPCload(BaseObj):
     """RPC load base object

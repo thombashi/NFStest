@@ -18,13 +18,14 @@ import sys
 import formatstr
 import packet.utils as utils
 from packet.pktt import Pktt
+import packet.record as record
 from optparse import OptionParser,OptionGroup,IndentedHelpFormatter
 
 # Module constants
 __author__    = "Jorge Mora (mora@netapp.com)"
 __copyright__ = "Copyright (C) 2014 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.0"
+__version__   = "1.3"
 
 USAGE = """%prog [options] <trace1.cap> [<trace2.cap> ...]
 
@@ -107,17 +108,17 @@ Examples:
     # Display all NFS file handles
     $ %prog -d "pkt.NFSop.fh" -m "len(nfs.fh) > 0" /tmp/trace.cap
 
-    # Display all RPC packets including the record infomation (packet number, timestamp, etc.)
+    # Display all RPC packets including the record information (packet number, timestamp, etc.)
     # For verbose level 1 (default) the "," separator will be converted to a
     # space if all items are only pkt(.*)? or pkt_call(.*)?
     $ %prog -d "pkt.record,pkt.rpc" -l rpc /tmp/trace.cap
 
-    # Display all RPC packets including the record infomation (packet number, timestamp, etc.)
+    # Display all RPC packets including the record information (packet number, timestamp, etc.)
     # For verbose level 2 the "," separator will be converted to a new line if
     # all items are only pkt(.*)? or pkt_call(.*)?
     $ %prog -v 2 -d "pkt.record,pkt.rpc" -l rpc /tmp/trace.cap
 
-    # Display all RPC packets including the record infomation (packet number, timestamp, etc.)
+    # Display all RPC packets including the record information (packet number, timestamp, etc.)
     # using the given display format
     $ %prog -d ">>> record: pkt.record   >>> rpc: pkt.rpc" -l rpc /tmp/trace.cap
 
@@ -162,14 +163,16 @@ ehelp = "End index [default: %default]"
 opts.add_option("-e", "--end", type="int", default=0, help=ehelp)
 mhelp = "Match string [default: %default]"
 opts.add_option("-m", "--match", default="True", help=mhelp)
-chelp = "If matching a reply packet, include its coresponding call in the output"
+chelp = "If matching a reply packet, include its corresponding call in the output"
 opts.add_option("-c", "--call", action="store_true", default=False, help=chelp)
-rhelp = "If matching a call packet, include its coresponding reply in the output"
+rhelp = "If matching a call packet, include its corresponding reply in the output"
 opts.add_option("-r", "--reply", action="store_true", default=False, help=rhelp)
 dhelp = "Print specific packet or part of a packet [default: %default]"
 opts.add_option("-d", "--display", default="pkt", help=dhelp)
 hhelp = "Time zone to use to display timestamps"
 opts.add_option("-z", "--tz", default=None, help=hhelp)
+hhelp = "Display progress bar [default: %default]"
+opts.add_option("--progress", type="int", default=1, help=hhelp)
 
 rpcdisp = OptionGroup(opts, "RPC display")
 hhelp = "Display RPC type [default: %default]"
@@ -187,6 +190,10 @@ hhelp = "Display NFSv4 main operation only [default: %default]"
 pktdisp.add_option("--nfs-mainop", default=str(utils.NFS_mainop), help=hhelp)
 hhelp = "Display RPC payload body [default: %default]"
 pktdisp.add_option("--load-body", default=str(utils.LOAD_body), help=hhelp)
+hhelp = "Display record frame number [default: %default]"
+pktdisp.add_option("--frame", default=str(record.FRAME), help=hhelp)
+hhelp = "Display packet number [default: %default]"
+pktdisp.add_option("--index", default=str(record.INDEX), help=hhelp)
 hhelp = "Display CRC16 encoded strings [default: %default]"
 pktdisp.add_option("--crc16", default=str(formatstr.CRC16), help=hhelp)
 hhelp = "Display CRC32 encoded strings [default: %default]"
@@ -222,6 +229,8 @@ utils.RPC_ver      = eval(vopts.rpc_ver)
 utils.RPC_xid      = eval(vopts.rpc_xid)
 utils.NFS_mainop   = eval(vopts.nfs_mainop)
 utils.LOAD_body    = eval(vopts.load_body)
+record.FRAME       = eval(vopts.frame)
+record.INDEX       = eval(vopts.index)
 utils.ENUM_CHECK   = eval(vopts.enum_check)
 formatstr.CRC16    = eval(vopts.crc16)
 formatstr.CRC32    = eval(vopts.crc32)
@@ -260,21 +269,21 @@ if vopts.display != "pkt":
 
 def display_pkt(vlevel, pkttobj):
     """Display packet for given verbose level"""
-    pkt = pkttobj.pkt
     if not vopts.verbose & vlevel:
         return
     level = 2
     if vlevel == 0x01:
         level = 1
     pkttobj.debug_repr(level)
+    pkt = pkttobj.pkt
 
     disp = str
     if vlevel == 0x04:
         disp = repr
 
     rpctype = 0
-    if pkttobj.pkt == "rpc":
-        rpctype = pkttobj.pkt.rpc.type
+    if pkt == "rpc":
+        rpctype = pkt.rpc.type
 
     if dlist:
         slist = []
@@ -299,9 +308,16 @@ def display_pkt(vlevel, pkttobj):
         out = disp(pkt)
     print out
 
+def display_packet(pkttobj):
+    """Display packet given the verbose level"""
+    if allpkts or pkttobj.pkt in layers:
+        for level in (0x01, 0x02, 0x04):
+            display_pkt(level, pkttobj)
+
 ################################################################################
 # Entry point
 pkttobj = Pktt(args)
+pkttobj.showprog = vopts.progress
 if vopts.start > 1:
     pkttobj[vopts.start - 1]
 if vopts.strsize > 0:
@@ -313,13 +329,15 @@ maxindex = None
 if vopts.end > 0:
     maxindex = vopts.end
 
-while pkttobj.match(vopts.match, rewind=False, reply=vopts.reply, maxindex=maxindex):
-    pkt = pkttobj.pkt
-    if pkt.record.index >= vopts.start:
-        if allpkts or pkt in layers:
-            if vopts.verbose & 0x01:
-                display_pkt(0x01, pkttobj)
-            if vopts.verbose & 0x02:
-                display_pkt(0x02, pkttobj)
-            if vopts.verbose & 0x04:
-                display_pkt(0x04, pkttobj)
+if vopts.match == "True":
+    # Do not use the match method, instead use the iterator method
+    # which is about 36% faster than match
+    for pkt in pkttobj:
+        if maxindex is not None and pkt.record.index >= maxindex:
+            break
+        display_packet(pkttobj)
+else:
+    while pkttobj.match(vopts.match, rewind=False, reply=vopts.reply, maxindex=maxindex):
+        display_packet(pkttobj)
+
+pkttobj.show_progress(True)

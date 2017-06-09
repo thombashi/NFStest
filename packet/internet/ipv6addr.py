@@ -22,10 +22,10 @@ care of '::' notation and leading zeroes.
 import nfstest_config as c
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
-__version__   = '1.0.1'
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
+__version__   = "1.1"
 
 class IPv6Addr(str):
     """IPv6Addr address object
@@ -70,6 +70,8 @@ class IPv6Addr(str):
                         # Expand first occurrence '::'
                         item = '0000' * (olen+1)
                         olen = 0
+                    elif item == '':
+                        item = '0000'
                     else:
                         # Add leading zeroes
                         item = "%04x" % int(item, 16)
@@ -78,17 +80,39 @@ class IPv6Addr(str):
             # Given format is a string of hex digits only
             if int(ip, 16) > 0xffffffffffffffffffffffffffffffff:
                 raise ValueError("IPv6 addresses cannot be larger than 0xffffffffffffffffffffffffffffffff: %s" % ip)
-            t = iter(ip)
-            olist = []
-            collapse = True
-            for a,b,c,d in zip(t,t,t,t):
-                n = int(a+b+c+d, 16)
-                expr = collapse and n == 0 and len(olist) > 0 and olist[-1] != ''
-                if n != 0 or expr:
-                    olist.append("%x" % n if n else '')
-                    if expr:
-                        # Only collapse the leftmost group of zeroes
-                        collapse = False
+            # Convert address into an array of 8 integers
+            olist = [int(ip[i:i+4], 16) for i in range(0, len(ip), 4)]
+            count, index = 0, 0
+            zlist = {}
+            for wd in olist:
+                if wd == 0:
+                    count += 1
+                else:
+                    if count > 1:
+                        # Found largest set of consecutive zeroes
+                        # save index of first zero
+                        zlist[index - count] = count
+                    count = 0
+                index += 1
+            if count > 1:
+                zlist[8 - count] = count
+            # Convert list of integers to list of hex strings
+            olist = ["%x"%x for x in olist]
+            for index in sorted(zlist, key=zlist.get, reverse=True):
+                count = zlist[index]
+                if count > 1:
+                    # Compress largest set of consecutive zeroes by replacing
+                    # all consecutive zeroes by an empty string
+                    for i in range(count):
+                        olist.pop(index)
+                    olist.insert(index, "")
+                    break
+            # Process special cases where consecutive zeroes
+            # are at the start or at the end
+            if olist[0] == "":
+                olist.insert(0, "")
+            if olist[-1] == "":
+                olist.append("")
             ip = ":".join(olist)
         return ip
 
@@ -106,13 +130,12 @@ class IPv6Addr(str):
         """Compare two IPv6 addresses and return False if both are equal."""
         return not self.__eq__(other)
 
-
 if __name__ == '__main__':
     # Self test of module
     ip = IPv6Addr('fe80000000000000020c29fffe5409ef')
     ipstr = "%s" % ip
     iprpr = "%r" % ip
-    ntests = 16
+    ntests = 22
 
     tcount = 0
     if ip == 0xFE80000000000000020C29FFFE5409EF:
@@ -151,6 +174,19 @@ if __name__ == '__main__':
     try:
         ip = IPv6Addr(0xffffffffffffffffffffffffffffffff + 1)
     except ValueError:
+        tcount += 1
+
+    if IPv6Addr("200104f800000002000000000000000d") == "2001:4f8:0:2::d":
+        tcount += 1
+    if IPv6Addr("200104f800000000000200000000000d") == "2001:4f8::2:0:0:d":
+        tcount += 1
+    if IPv6Addr("0:0:0:0:0:0:0:1") == "::1":
+        tcount += 1
+    if IPv6Addr("0:0:0:0:0:0:0:0") == "::":
+        tcount += 1
+    if IPv6Addr("1:0:0:0:0:0:0:0") == "1::":
+        tcount += 1
+    if IPv6Addr("1:0:0:2:0:0:0:0") == "1:0:0:2::":
         tcount += 1
 
     if tcount == ntests:

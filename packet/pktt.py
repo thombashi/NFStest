@@ -40,12 +40,15 @@ Packet layers supported:
 """
 import os
 import re
+import sys
 import gzip
 import time
+import fcntl
 import token
 import struct
 import parser
 import symbol
+import termios
 from formatstr import *
 import nfstest_config as c
 from baseobj import BaseObj
@@ -58,7 +61,7 @@ from packet.link.ethernet import ETHERNET
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2012 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "2.0"
+__version__   = "2.3"
 
 BaseObj.debug_map(0x100000000, 'pkt1', "PKT1: ")
 BaseObj.debug_map(0x200000000, 'pkt2', "PKT2: ")
@@ -72,6 +75,13 @@ _token_map = dict(token.tok_name.items() + symbol.sym_name.items())
 _nfsopmap = {'status': 1, 'tag': 1}
 # Match function map
 _match_func_map = dict(zip(PKT_layers,["self._match_%s"%x for x in PKT_layers]))
+
+# Read size -- the amount of data read at a time from the file
+# The read ahead buffer actual size is always >= 2*READ_SIZE
+READ_SIZE = 64*1024
+
+# Show progress if stderr is a tty and stdout is not
+SHOWPROG = os.isatty(2) and not os.isatty(1)
 
 class Header(BaseObj):
     # Class attributes
@@ -126,8 +136,11 @@ class Pktt(BaseObj, Unpack):
         self.boffset = 0      # File offset of current packet
         self.ioffset = 0      # File offset of first packet
         self.index   = 0      # Current packet index
+        self.frame   = 1      # Current frame number
         self.mindex  = 0      # Maximum packet index for current trace file
         self.findex  = 0      # Current tcpdump file index (used with self.live)
+        self.pindex  = 0      # Current packet index (for pktlist)
+        self.pktlist = None   # Match from this packet list instead
         self.fh      = None   # Current file handle
         self.eof     = False  # End of file marker for current packet trace
         self.serial  = False  # Processing trace files serially
@@ -135,6 +148,17 @@ class Pktt(BaseObj, Unpack):
         self.pkt_call  = None # The current packet call if self.pkt is a reply
         self.pktt_list = []   # List of Pktt objects created
         self.tfiles    = []   # List of packet trace files
+        self.rdbuffer  = ""   # Read buffer
+        self.rdoffset  = 0    # Read buffer offset
+        self.filesize  = 0    # Size of packet trace file
+        self.prevprog  = -1.0 # Previous progress percentage
+        self.prevtime  = 0.0  # Previous segment time
+        self.prevdone  = -1   # Previous progress bar units done so far
+        self.prevoff   = 0    # Previous offset
+        self.showprog  = 0    # If this is true the progress will be displayed
+        self.progdone  = 0    # Display last progress only once
+        self.timestart = time.time() # Time reference base
+        self.reply_matched = False   # Matching a reply
 
         # TCP stream map: to keep track of the different TCP streams within
         # the trace file -- used to deal with RPC packets spanning multiple
@@ -278,8 +302,14 @@ class Pktt(BaseObj, Unpack):
                 if minsecs is None or obj.pkt.record.secs < minsecs:
                     minsecs = obj.pkt.record.secs
                     pktt_obj = obj
+            if self.filesize == 0:
+                # Calculate total bytes to process
+                for obj in self.pktt_list:
+                    self.filesize += obj.filesize
             if pktt_obj is None:
                 # All packet trace files have been processed
+                self.offset = self.filesize
+                self.show_progress(True)
                 raise StopIteration
             elif len(self._tcp_stream_map):
                 # This packet trace file should be processed serially
@@ -297,6 +327,7 @@ class Pktt(BaseObj, Unpack):
             self.pkt_call = pktt_obj.pkt_call
             self.tfile = pktt_obj.tfile
             self.pkt.record.index = self.index  # Use a cumulative index
+            self.offset += pktt_obj.offset - pktt_obj.boffset
 
             try:
                 # Get next packet for this packet trace object
@@ -319,9 +350,21 @@ class Pktt(BaseObj, Unpack):
                     self._tcp_stream_map = pktt_obj._tcp_stream_map
                     self._rpc_xid_map    = pktt_obj._rpc_xid_map
 
+            self.show_progress()
+
             # Increment cumulative packet index
             self.index += 1
             return self.pkt
+
+        if self.boffset != self.offset:
+            # Frame number is one for every record header on the pcap trace
+            # On the other hand self.index is the packet number. Since there
+            # could be multiple packets on a single frame self.index could
+            # be larger the self.frame except that self.index start at 0
+            # while self.frame starts at 1.
+            # The frame number can be used to match packets with other tools
+            # like wireshark
+            self.frame += 1
 
         # Save file offset for this packet
         self.boffset = self.offset
@@ -330,6 +373,8 @@ class Pktt(BaseObj, Unpack):
         data = self._read(16)
         if len(data) < 16:
             self.eof = True
+            self.offset = self.filesize
+            self.show_progress(True)
             raise StopIteration
         # Decode record header
         record = Record(self, data)
@@ -338,6 +383,9 @@ class Pktt(BaseObj, Unpack):
         self.unpack = Unpack(self._read(record.length_inc))
         if self.unpack.size() < record.length_inc:
             # Record has been truncated, stop iteration
+            self.eof = True
+            self.offset = self.filesize
+            self.show_progress(True)
             raise StopIteration
 
         if self.header.link_type == 1:
@@ -346,6 +394,8 @@ class Pktt(BaseObj, Unpack):
         else:
             # Unknown link layer
             record.data = self.unpack.getbytes()
+
+        self.show_progress()
 
         # Increment packet index
         self.index += 1
@@ -359,6 +409,9 @@ class Pktt(BaseObj, Unpack):
            of packets processed so far.
         """
         self.dprint('PKT1', ">>> rewind(%d)" % index)
+        if self.pktlist is not None:
+            self.pindex = index
+            return True
         if index >= 0 and index < self.index:
             if len(self.pktt_list) > 1:
                 # Dealing with multiple trace files
@@ -379,7 +432,7 @@ class Pktt(BaseObj, Unpack):
                 self.eof    = False
 
                 # Position the file pointer to the offset of the first packet
-                self._getfh().seek(self.offset)
+                self.seek(self.ioffset)
 
                 # Clear state
                 self._tcp_stream_map = {}
@@ -397,6 +450,23 @@ class Pktt(BaseObj, Unpack):
             return True
         return False
 
+    def seek(self, offset, whence=os.SEEK_SET, hard=False):
+        """Position the read offset correctly
+           If new position is outside the current read buffer then clear the
+           buffer so a new chunk of data will be read from the file instead
+        """
+        soffset = self.fh.tell() - len(self.rdbuffer)
+        if hard or offset < soffset or whence != os.SEEK_SET:
+            # Seek is before the read buffer, do the actual seek
+            self.rdbuffer = ""
+            self.rdoffset = 0
+            self.fh.seek(offset, whence)
+            self.offset = self.fh.tell()
+        else:
+            # Seek is not before the read buffer
+            self.rdoffset = offset - soffset
+            self.offset = offset
+
     def _getfh(self):
         """Get the filehandle of the trace file, open file if necessary."""
         if self.fh == None:
@@ -407,6 +477,7 @@ class Pktt(BaseObj, Unpack):
 
             # Open trace file
             self.fh = open(self.tfile, 'rb')
+            self.filesize = fstat.st_size
 
             iszip = False
             self.header_fmt = None
@@ -432,7 +503,12 @@ class Pktt(BaseObj, Unpack):
                     if iszip:
                         raise Exception('Not a tcpdump file')
                     iszip = True
-                    self.fh.seek(0)
+                    # Get the size of the uncompressed file, this only works
+                    # for uncompressed files less than 4GB
+                    self.fh.seek(-4, os.SEEK_END)
+                    self.filesize = struct.unpack("<I", self.fh.read(4))[0]
+                    # Do a hard seek -- clear read ahead buffer
+                    self.seek(0, hard=True)
                     # Try if this is a gzip compress file
                     self.fh = gzip.GzipFile(fileobj=self.fh)
 
@@ -451,9 +527,27 @@ class Pktt(BaseObj, Unpack):
            takes care of <EOF> when 'live' option is set which keeps on trying
            to read and switching files when needed.
         """
+        # Open packet trace if needed
+        self._getfh()
         while True:
-            # Read number of bytes specified
-            data = self._getfh().read(count)
+            # Get the number of bytes specified
+            rdsize = len(self.rdbuffer) - self.rdoffset
+            if count > rdsize:
+                # Not all bytes needed are in the read buffer
+                if self.rdoffset > READ_SIZE:
+                    # If the read offset is on the second half of the
+                    # 2*READ_SIZE buffer discard the first bytes so the
+                    # new read offset is right at the middle of the buffer
+                    # This is done in case there is a seek behind the current
+                    # offset so data is not read from the file again
+                    self.rdbuffer = self.rdbuffer[self.rdoffset-READ_SIZE:]
+                    self.rdoffset = READ_SIZE
+                # Read next chunk from file
+                self.rdbuffer += self.fh.read(max(count, READ_SIZE))
+            # Get the bytes requested and increment read offset accordingly
+            data = self.rdbuffer[self.rdoffset:self.rdoffset+count]
+            self.rdoffset += count
+
             ldata = len(data)
             if self.live and ldata != count:
                 # Not all data was read (<EOF>)
@@ -470,7 +564,7 @@ class Pktt(BaseObj, Unpack):
                     self.bfile = basefile
                     self.findex = findex
                 # Re-position file pointer to last known offset
-                self._getfh().seek(self.offset)
+                self.seek(self.offset)
                 time.sleep(1)
             else:
                 break
@@ -577,6 +671,24 @@ class Pktt(BaseObj, Unpack):
         self.dprint('PKT2', "    %d: match_%s(%s) -> %r" % (self.pkt.record.index, layer, uargs, texpr))
         return texpr
 
+    def get_index(self):
+        """Get current packet index"""
+        if self.pktlist is None:
+            return self.index
+        else:
+            return self.pindex
+
+    def set_pktlist(self, pktlist=None):
+        """Set the current packet list for buffered matching in which the
+           match method will only use this list instead of getting the next
+           packet from the packet trace file.
+           This could be used when there is a lot of matching going back
+           and forth but only on a particular set of packets.
+           See the match() method for an example of buffered matching.
+        """
+        self.pindex  = 0
+        self.pktlist = pktlist
+
     def clear_xid_list(self):
         """Clear list of outstanding xids"""
         self._match_xid_list = []
@@ -674,7 +786,7 @@ class Pktt(BaseObj, Unpack):
            simply 'nfsobj.array[0].sequenceid == 25'.
 
            This approach makes the match expressions simpler at the expense of
-           having some ambiguities on where the actual matched occurred. If a
+           having some ambiguities on where the actual match occurred. If a
            match is desired on a specific operation, a more qualified name can
            be given. In the above example, in order to match the status of the
            PUTFH operation the match expression 'NFS.opputfh.status == 0' can
@@ -797,24 +909,59 @@ class Pktt(BaseObj, Unpack):
                if ("NFS.argop == 38" in x):
                    print x.pkt.nfs
 
+               # Get a list of all OPEN and CLOSE packets then use buffered
+               # matching to process each OPEN and its corresponding CLOSE
+               # at a time including both requests and replies
+               pktlist = []
+               while x.match("NFS.op in [4,18]"):
+                   pktlist.append(x.pkt)
+               # Enable buffered matching
+               x.set_pktlist(pktlist)
+               while x.match("NFS.argop == 18"): # Find OPEN request
+                   print x.pkt
+                   index = x.get_index()
+                   # Find OPEN reply
+                   x.match("RPC.xid == %d and NFS.resop == 18" % x.pkt.rpc.xid)
+                   print x.pkt
+                   # Find corresponding CLOSE request
+                   stid = x.escape(x.pkt.NFSop.stateid.other)
+                   x.match("NFS.argop == 4 and NFS.stateid == '%s'" % stid)
+                   print x.pkt
+                   # Find CLOSE reply
+                   x.match("RPC.xid == %d and NFS.resop == 4" % x.pkt.rpc.xid)
+                   print x.pkt
+                   # Rewind to right after the OPEN request
+                   x.rewind(index)
+               # Disable buffered matching
+               x.set_pktlist()
+
            See also:
                match_ethernet(), match_ip(), match_tcp(), match_rpc(), match_nfs()
         """
-        # Save current position
-        save_index = self.index
-
         # Parse match expression
         st = parser.expr(expr)
         smap = parser.st2list(st)
         pdata = self._convert_match(smap)
         self.dprint('PKT1', ">>> %d: match(%s)" % (self.index, expr))
         self.reply_matched = False
+        if self.pktlist is None:
+            pkt_list   = self
+            save_index = self.index
+        else:
+            pkt_list   = self.pktlist
+            save_index = self.pindex
 
         # Search one packet at a time
-        for pkt in self:
+        for pkt in pkt_list:
             if maxindex and self.index > maxindex:
                 # Hit maxindex limit
                 break
+            if self.pktlist is not None:
+                if pkt.record.index < self.pindex:
+                    continue
+                else:
+                    self.pindex = pkt.record.index + 1
+                    self.pkt = pkt
             try:
                 if reply and pkt == "rpc" and pkt.rpc.type == 1 and pkt.rpc.xid in self._match_xid_list:
                     self.dprint('PKT1', ">>> %d: match() -> True: reply" % pkt.record.index)
@@ -834,10 +981,68 @@ class Pktt(BaseObj, Unpack):
         if rewind:
             # No packet matched, re-position the file pointer back to where
             # the search started
-            self.rewind(save_index)
+            if self.pktlist is None:
+                self.rewind(save_index)
+            else:
+                self.pindex = save_index
         self.pkt = None
         self.dprint('PKT1', ">>> match() -> False")
         return None
+
+    def show_progress(self, done=False):
+        """Display progress bar if enabled and if running on correct terminal"""
+        if SHOWPROG and self.showprog and (done or self.index % 500 == 0) \
+          and (os.getpgrp() == os.tcgetpgrp(sys.stderr.fileno())):
+            rows, columns = struct.unpack('hh', fcntl.ioctl(2, termios.TIOCGWINSZ, "1234"))
+            if columns < 100:
+                sps = 30
+            else:
+                # Terminal is wide enough, include bytes/sec
+                sps = 42
+            # Progress bar length
+            wlen = int(columns) - len(str_units(self.filesize)) - sps
+            # Number of bytes per progress bar unit
+            xunit = float(self.filesize)/wlen
+            # Progress bar units done so far
+            xdone = int(self.offset/xunit)
+            xtime = time.time()
+            progress = 100.0*self.offset/self.filesize
+
+            # Display progress only if there is some change in progress
+            if (done and not self.progdone) or (self.prevdone != xdone or \
+               int(self.prevtime) != int(xtime) or \
+               round(self.prevprog) != round(progress)):
+                if done:
+                    # Do not display progress again when done=True
+                    self.progdone = 1
+                otime  = xtime - self.timestart # Overall time
+                tdelta = xtime - self.prevtime  # Segment time
+                self.prevprog = progress
+                self.prevdone = xdone
+                self.prevtime = xtime
+                # Number of progress bar units for completion
+                slen = wlen - xdone
+                if done:
+                    # Overall average bytes/sec
+                    bps = self.offset / otime
+                else:
+                    # Segment average bytes/sec
+                    bps = (self.offset - self.prevoff) / tdelta
+                self.prevoff = self.offset
+                # Progress bar has both foreground and background colors
+                # as green and in case the terminal does not support colors
+                # then a "=" is displayed instead instead of a green block
+                pbar = " [\033[32m\033[42m%s\033[m%s] " % ("="*xdone, " "*slen)
+                # Add progress percentage and how many bytes have been
+                # processed so far relative to the total number of bytes
+                pbar += "%5.1f%% %9s/%s" % (progress, str_units(self.offset), str_units(self.filesize))
+                if columns < 100:
+                    sys.stderr.write("%s %-6s\r" % (pbar, str_time(otime)))
+                else:
+                    # Terminal is wide enough, include bytes/sec
+                    sys.stderr.write("%s %9s/s %-6s\r" % (pbar, str_units(bps), str_time(otime)))
+                if done:
+                    sys.stderr.write("\n")
 
     @staticmethod
     def escape(data):

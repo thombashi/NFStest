@@ -30,7 +30,7 @@ from string import Formatter
 __author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2014 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = "1.2"
+__version__   = "1.5"
 
 # Display variables
 CRC16 = True
@@ -106,6 +106,25 @@ def int_units(value):
         value = int(float(v) * (1<<(10*UNIT_SUFFIXES.index(m.upper()))))
     return value
 
+def str_time(value):
+    """Convert the number of seconds to a string with a format of "[h:]mm:ss"
+
+       value:
+           Time value to convert (in seconds)
+
+       Examples:
+           out = str_time(123.0) # out = "02:03"
+           out = str_time(12345) # out = "3:25:45"
+    """
+    ret = ""
+    value = int(value)
+    hh = value/3600
+    mm = (value-3600*hh)/60
+    ss = value%60
+    if hh > 0:
+        ret += "%d:" % hh
+    return ret + "%02d:%02d" % (mm, ss)
+
 def crc32(value):
     """Convert string to its crc32 representation"""
     return binascii.crc32(value) & 0xffffffff
@@ -114,7 +133,7 @@ def crc16(value):
     """Convert string to its crc16 representation"""
     return binascii.crc_hqx(value, 0xa5a5) & 0xffff
 
-def hex(value):
+def hexstr(value):
     """Convert string to its hex representation"""
     return "0x" + value.encode("hex")
 
@@ -161,16 +180,16 @@ class FormatStr(Formatter):
            out = x.vformat("{key}: {value}", named_args)
            out = x.vformat("{key}: {value}, {0}, {1}", pos_args, named_args)
 
-           # Convert string into hex
+           # Display string in hex
            out = x.format("{0:x}", "hello")  # out = "68656c6c6f"
 
-           # Convert string into hex with leading 0x
+           # Display string in hex with leading 0x
            out = x.format("{0:#x}", "hello") # out = "0x68656c6c6f"
 
-           # Convert string into crc32
+           # Display string in crc32
            out = x.format("{0:crc32}", "hello") # out = "0x3610a686"
 
-           # Convert string into crc16
+           # Display string in crc16
            out = x.format("{0:crc16}", "hello") # out = "0x9c62"
 
            # Substring using "@" format modifier
@@ -181,6 +200,23 @@ class FormatStr(Formatter):
            out = x.format("{0:@3}", "hello") # out = "lo"
            out = x.format("{0:.2}", "hello") # out = "he"
 
+           # Conditionally display the first format if argument is not None,
+           # else the second format is displayed
+           # Format: {0:?format1:format2}
+           out = x.format("{0:?tuple({0}, {1})}", 1, 2)    # out = "tuple(1, 2)"
+           out = x.format("{0:?tuple({0}, {1})}", None, 2) # out = ""
+           # Using 'else' format (including the escaping of else character):
+           out = x.format("{0:?sid\:{0}:NONE}", 5)    # out = "sid:5"
+           out = x.format("{0:?sid\:{0}:NONE}", None) # out = "NONE"
+
+           # Nested formatting for strings, where processing is done in
+           # reversed order -- process the last format first
+           # Format: {0:fmtN:...:fmt2:fmt1}
+           #   Display substring of 4 bytes as hex (substring then hex)
+           out = x.format("{0:#x:.4}", "hello") # out = "0x68656c6c"
+           #   Display first 4 bytes of string in hex (hex then substring)
+           out = x.format("{0:.4:#x}", "hello") # out = "0x68"
+
            # Integer extension to display umax name instead of the value
            # Format: {0:max32|umax32|max64|umax64}
            # Output: if value matches the largest number in format given,
@@ -190,7 +226,7 @@ class FormatStr(Formatter):
 
            # Number extension to display the value with units
            # Format: {0:units[.precision]}
-           # Output: convert value to a string with units, by default
+           # Output: display value as a string with units, by default
            #         precision=2 and all trailing zeros are removed.
            #         To force the precision use a negative number.
            out = x.format("{0:units}", 1024)    # out = "1KB"
@@ -217,6 +253,14 @@ class FormatStr(Formatter):
     """
     def format_field(self, value, format_spec):
         """Override original method to include modifier extensions"""
+        if len(format_spec) > 1 and format_spec[0] == "?":
+            # Conditional directive
+            # Format {0:?format1:format2}
+            data = re.split(r"(?<!\\):", format_spec)
+            if value is not None:
+                return data[0][1:].replace("\\:", ":")
+            elif len(data) > 1:
+                return data[1].replace("\\:", ":")
         if value is None:
             # No value is given
             return ""
@@ -227,6 +271,12 @@ class FormatStr(Formatter):
             # This is an object derived from int, convert it to string
             value = str(value)
         if isinstance(value, str):
+            fmtlist = (xmod+fmt).split(":")
+            if len(fmtlist) > 1:
+                # Nested format, process in reversed order
+                for sfmt in reversed(fmtlist):
+                    value = self.format_field(value, sfmt)
+                return value
             if fmt == "x":
                 # Display string in hex
                 xprefix = ""

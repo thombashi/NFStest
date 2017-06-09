@@ -24,10 +24,10 @@ from packet.nfs.nfs3 import NFS3args,NFS3res
 from packet.nfs.nfs4 import COMPOUND4args,COMPOUND4res,CB_COMPOUND4args,CB_COMPOUND4res
 
 # Module constants
-__author__    = 'Jorge Mora (%s)' % c.NFSTEST_AUTHOR_EMAIL
+__author__    = "Jorge Mora (%s)" % c.NFSTEST_AUTHOR_EMAIL
 __copyright__ = "Copyright (C) 2014 NetApp, Inc."
 __license__   = "GPL v2"
-__version__   = '1.1'
+__version__   = "1.2"
 
 def NFS(rpc, callback):
     """Process the NFS layer and return the correct NFS object"""
@@ -67,4 +67,5 @@ def NFS(rpc, callback):
             # RPC reply
             ret = NFS3res(unpack, rpc.procedure)
 
+    ret.callback = callback
     return ret

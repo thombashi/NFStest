@@ -113,7 +113,7 @@ class InteropTest(TestUtil):
             # after data has been written by other NFS versions.
             mtargs = dict(data_map[version]["args"])
             mtargs["mtpoint"] = self.mtpoint
-            self.trace_start("/tmp/0.trc")
+            self.trace_start()
             self.mount(**mtargs)
 
             # Get a new file name
