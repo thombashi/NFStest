@@ -124,6 +124,11 @@ OPENMAP = {
     os.O_SYNC:   "O_SYNC",
 }
 
+class NoFilesMatchingCondition(Exception):
+    """No files were found to match the given condition"""
+    pass
+
+
 class TermSignal(Exception):
     """Exception to be raised on SIGTERM signal"""
     pass
@@ -481,12 +486,12 @@ class FileIO(BaseObj):
             return False
         return self.random.randint(0,99) < pvalue
 
-    def _get_fileobj(self):
-        """Get a random file object"""
-        # Number of files available
-        nlen = len(self.n_files)
-        self.findex = self.random.randint(0, nlen-1)
-        return self.n_files[self.findex]
+    def _get_fileobj(self, condition=None):
+        """Get a random file object that fulfills condition"""
+        files_matching_condition = [file_obj for file_obj in self.n_files if condition(file_obj)] if condition else self.n_files
+        if len(files_matching_condition) == 0:
+            raise NoFilesMatchingCondition()
+        return self.random.choice(files_matching_condition)
 
     def _getiolist(self, size, iswrite):
         """Return list of I/O blocks to read/write"""
@@ -683,23 +688,17 @@ class FileIO(BaseObj):
             self._dprint("DBG2", "REMOVE  %s" % fileobj.name)
             os.unlink(self.absfile)
             self.nremove += 1
-            self.n_files.pop(self.findex)
+            self.n_files.remove(fileobj)
             return
 
         if nlen > self.minfiles and self._percent(self.link):
             # Create hard link
             name = self._newname()
             self.absfile = os.path.join(self.datadir, name)
-            index = 0
-            while True:
-                index += 1
-                fileobj = self._get_fileobj()
-                if not hasattr(fileobj, 'srcname'):
-                    # This file is not a symbolic link, use it
-                    break
-                if index >= 10:
-                    self.absfile = os.path.join(self.datadir, fileobj.name)
-                    raise Exception("Unable to find a valid source file for hard link")
+            try:
+                fileobj = self._get_fileobj(condition=lambda f: not hasattr(f, 'srcname'))
+            except NoFilesMatchingCondition:
+                raise Exception("Unable to find a valid source file for hard link")
             srcfile = os.path.join(self.datadir, fileobj.name)
             self._dprint("DBG2", "LINK    %s -> %s" % (name, fileobj.name))
             os.link(srcfile, self.absfile)
@@ -712,16 +711,10 @@ class FileIO(BaseObj):
             # Create symbolic link
             name = self._newname()
             self.absfile = os.path.join(self.datadir, name)
-            index = 0
-            while True:
-                index += 1
-                fileobj = self._get_fileobj()
-                if not hasattr(fileobj, 'srcname'):
-                    # This file is not a symbolic link, use it
-                    break
-                if index >= 10:
-                    self.absfile = os.path.join(self.datadir, fileobj.name)
-                    raise Exception("Unable to find a valid source file for symbolic link")
+            try:
+                fileobj = self._get_fileobj(condition=lambda f: not hasattr(f, 'srcname'))
+            except NoFilesMatchingCondition:
+                raise Exception("Unable to find a valid source file for symbolic link")
             self._dprint("DBG2", "SLINK   %s -> %s" % (name, fileobj.name))
             os.symlink(fileobj.name, self.absfile)
             self.nslink += 1
