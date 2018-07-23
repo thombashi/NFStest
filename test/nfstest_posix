@@ -307,13 +307,13 @@ class PosixTest(TestUtil):
            and then by changing back to the original directory.
         """
         self.test_group("Verify POSIX API chdir() on %s" % self.nfsstr())
-
         cwd_orig = os.getcwd()
         self.create_dir()
         self.dprint('DBG3', "Change to directory %s using POSIX API chdir()" % self.absdir)
+        cwd_old = cwd_orig+'/'+self.absdir
         posix.chdir(self.absdir)
         cwd = os.getcwd()
-        self.test(cwd == self.absdir, "chdir - current working directory should be changed")
+        self.test(cwd == cwd_old, "chdir - current working directory should be changed")
         posix.chdir(cwd_orig)
         cwd = os.getcwd()
         self.test(cwd == cwd_orig, "chdir - current working directory should be changed back to the original directory")
@@ -1352,6 +1352,8 @@ class PosixTest(TestUtil):
         srcfile = self.absfile
         self.get_filename()
         self.dprint('DBG3', "Creating symbolic link [%s -> %s]" % (self.absfile, srcfile))
+        cwd=os.getcwd()
+        srcfile=cwd+'/'+srcfile
         os.symlink(srcfile, self.absfile)
         oldname = self.absfile
         self.get_filename()
