@@ -1065,7 +1065,7 @@ class PosixTest(TestUtil):
                 os.chmod(self.absfile, 0777)
                 if ftype == SYMLINK:
                     # Create symbolic link
-                    srcfile = self.absfile
+                    srcfile = os.getcwd()+'/'+self.absfile
                     self.get_filename()
                     self.dprint('DBG3', "Creating symbolic link file [%s -> %s]" % (self.absfile, srcfile))
                     os.symlink(srcfile, self.absfile)
