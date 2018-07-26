@@ -831,14 +831,16 @@ class PosixTest(TestUtil):
         testdir = self.absdir
 
         self.test_info("Symbolic link to a file")
-        srcfile = testfile
+        cwd=os.getcwd()
+        srcfile = cwd+'/'+testfile
         self.get_filename()
         self.dprint('DBG3', "Creating symbolic link to file [%s -> %s]" % (self.absfile, srcfile))
         os.symlink(srcfile, self.absfile)
         self._stat_obj(0754, stat_mode=stat_mode, type='symbolic link', srcfile=srcfile)
 
         self.test_info("Symbolic link to a directory")
-        srcfile = testdir
+        cwd=os.getcwd()
+        srcfile = cwd+'/'+testdir
         self.get_filename()
         self.dprint('DBG3', "Creating symbolic link to directory [%s -> %s]" % (self.absfile, srcfile))
         os.symlink(srcfile, self.absfile)
